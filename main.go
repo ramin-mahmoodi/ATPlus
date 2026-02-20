@@ -31,8 +31,8 @@ var (
 	bold    = "\033[1m"
 	reset   = "\033[0m"
 
-	minConnections = 20
-	maxConnections = 500
+	minConnections = 100
+	maxConnections = 1000
 )
 
 func init() {
@@ -98,6 +98,8 @@ func deobfuscatePort(obfuscated []byte, key []byte) uint16 {
 func tuneSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(4194304)
+		tcpConn.SetWriteBuffer(4194304)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
@@ -246,10 +248,12 @@ func startEurope() {
 				go createReverseLink()
 			}
 		} else if current < maxConnections {
-			// Slowly add more if needed, but not all at once
-			go createReverseLink()
+			// Add connections rapidly to satisfy high bursts and prevent slow ramp-up
+			for i := 0; i < 10 && (current+i) < maxConnections; i++ {
+				go createReverseLink()
+			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -305,18 +309,10 @@ func startIran() {
 
 				go func(c net.Conn) {
 					// Get valid Europe connection
-					var eConn net.Conn
-					for {
-						var ok bool
-						eConn, ok = <-connPool
-						if !ok {
-							c.Close()
-							return
-						}
-						// Test if alive by setting brief deadline and peeking?
-						// Because of SetKeepAlive, dead conns will eventually error out.
-						// We assume it's valid if it's in the channel.
-						break
+					eConn, ok := <-connPool
+					if !ok {
+						c.Close()
+						return
 					}
 
 					// Send target port

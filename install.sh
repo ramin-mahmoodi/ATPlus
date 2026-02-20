@@ -15,6 +15,19 @@ echo ""
 
 systemctl stop atplus 2>/dev/null
 
+echo "[+] Applying Network Optimizations (BBR & TCP Buffers)..."
+cat > /etc/sysctl.d/99-atplus.conf << 'SYSCTL_EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_slow_start_after_idle = 0
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+SYSCTL_EOF
+sysctl -p /etc/sysctl.d/99-atplus.conf 2>/dev/null
+sysctl --system 2>/dev/null
+
 echo "[+] Checking for Golang compiler..."
 if ! command -v go &> /dev/null; then
     echo "[-] Go is not installed. Installing Go..."
@@ -101,7 +114,13 @@ var (
 
 	poolMu         sync.Mutex
 	sessionPool    []*smux.Session
-	maxSmuxTunnels = 5
+	maxSmuxTunnels = 16
+
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32768)
+		},
+	}
 )
 
 func init() {
@@ -168,13 +187,17 @@ func deobfuscatePort(obfuscated []byte, key []byte) uint16 {
 func tuneSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(4194304)
+		tcpConn.SetWriteBuffer(4194304)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
 
 func fastPipe(src net.Conn, dst net.Conn) {
-	io.Copy(dst, src)
+	buf := bufferPool.Get().([]byte)
+	io.CopyBuffer(dst, src, buf)
+	bufferPool.Put(buf)
 	src.Close()
 	dst.Close()
 }
@@ -235,8 +258,8 @@ func createEuropeMultiplexer() (*smux.Session, error) {
 	tlsConn.Write(authKey)
 
 	smuxConfig := smux.DefaultConfig()
-	smuxConfig.MaxReceiveBuffer = 4194304 * 2
-	smuxConfig.MaxStreamBuffer = 4194304
+	smuxConfig.MaxReceiveBuffer = 4194304 * 4
+	smuxConfig.MaxStreamBuffer = 4194304 * 2
 	smuxConfig.KeepAliveInterval = 10 * time.Second
 	smuxConfig.KeepAliveTimeout = 30 * time.Second
 	session, err := smux.Client(tlsConn, smuxConfig)
@@ -288,34 +311,61 @@ func startEurope() {
 
 	go func() {
 		for {
+			time.Sleep(10 * time.Minute)
+			poolMu.Lock()
+			if len(sessionPool) > 0 {
+				oldSession := sessionPool[0]
+				sessionPool = sessionPool[1:]
+				poolMu.Unlock()
+				oldSession.Close()
+			} else {
+				poolMu.Unlock()
+			}
+		}
+	}()
+
+	go func() {
+		for {
 			poolMu.Lock()
 			currentLinks := len(sessionPool)
 			poolMu.Unlock()
 
 			if currentLinks < maxSmuxTunnels {
-				if session, err := createEuropeMultiplexer(); err == nil {
-					poolMu.Lock()
-					sessionPool = append(sessionPool, session)
-					poolMu.Unlock()
-					
-					go func(sess *smux.Session) {
-						for {
-							stream, err := sess.AcceptStream()
-							if err != nil { break }
-							go handleEuropeStream(stream)
-						}
-						poolMu.Lock()
-						for i, s := range sessionPool {
-							if s == sess {
-								sessionPool = append(sessionPool[:i], sessionPool[i+1:]...)
-								break
+				var wg sync.WaitGroup
+				needed := maxSmuxTunnels - currentLinks
+				for i := 0; i < needed; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if session, err := createEuropeMultiplexer(); err == nil {
+							poolMu.Lock()
+							if len(sessionPool) < maxSmuxTunnels {
+								sessionPool = append(sessionPool, session)
+								go func(sess *smux.Session) {
+									for {
+										stream, err := sess.AcceptStream()
+										if err != nil { break }
+										go handleEuropeStream(stream)
+									}
+									poolMu.Lock()
+									for k, s := range sessionPool {
+										if s == sess {
+											sessionPool = append(sessionPool[:k], sessionPool[k+1:]...)
+											break
+										}
+									}
+									poolMu.Unlock()
+								}(session)
+							} else {
+								session.Close()
 							}
+							poolMu.Unlock()
 						}
-						poolMu.Unlock()
-					}(session)
+					}()
 				}
+				wg.Wait()
 			}
-			time.Sleep(1 * time.Second)
+			time.Sleep(200 * time.Millisecond)
 		}
 	}()
 
@@ -523,8 +573,8 @@ func startIran() {
 			tlsConn.SetReadDeadline(time.Time{})
 			
 			smuxConfig := smux.DefaultConfig()
-			smuxConfig.MaxReceiveBuffer = 4194304 * 2
-			smuxConfig.MaxStreamBuffer = 4194304
+			smuxConfig.MaxReceiveBuffer = 4194304 * 4
+			smuxConfig.MaxStreamBuffer = 4194304 * 2
 			smuxConfig.KeepAliveInterval = 10 * time.Second
 			smuxConfig.KeepAliveTimeout = 30 * time.Second
 			session, err := smux.Server(tlsConn, smuxConfig)
