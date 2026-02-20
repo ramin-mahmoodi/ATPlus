@@ -235,6 +235,8 @@ func createEuropeMultiplexer() (*smux.Session, error) {
 	tlsConn.Write(authKey)
 
 	smuxConfig := smux.DefaultConfig()
+	smuxConfig.MaxReceiveBuffer = 4194304 * 2
+	smuxConfig.MaxStreamBuffer = 4194304
 	smuxConfig.KeepAliveInterval = 10 * time.Second
 	smuxConfig.KeepAliveTimeout = 30 * time.Second
 	session, err := smux.Client(tlsConn, smuxConfig)
@@ -521,6 +523,8 @@ func startIran() {
 			tlsConn.SetReadDeadline(time.Time{})
 			
 			smuxConfig := smux.DefaultConfig()
+			smuxConfig.MaxReceiveBuffer = 4194304 * 2
+			smuxConfig.MaxStreamBuffer = 4194304
 			smuxConfig.KeepAliveInterval = 10 * time.Second
 			smuxConfig.KeepAliveTimeout = 30 * time.Second
 			session, err := smux.Server(tlsConn, smuxConfig)
