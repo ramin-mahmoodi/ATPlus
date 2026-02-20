@@ -103,11 +103,32 @@ func tuneSocket(conn net.Conn) {
 	}
 }
 
-func fastPipe(src net.Conn, dst net.Conn) {
-	// io.Copy automatically uses splice/sendfile on Linux for TCP connections when possible
-	io.Copy(dst, src)
-	src.Close()
-	dst.Close()
+func proxyConn(c1, c2 net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	copySide := func(dst, src net.Conn) {
+		defer wg.Done()
+		buf := make([]byte, 64*1024)
+		io.CopyBuffer(dst, src, buf)
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		} else {
+			dst.Close()
+		}
+		if tc, ok := src.(*net.TCPConn); ok {
+			tc.CloseRead()
+		} else {
+			src.Close()
+		}
+	}
+
+	go copySide(c1, c2)
+	go copySide(c2, c1)
+
+	wg.Wait()
+	c1.Close()
+	c2.Close()
 }
 
 // ================= EUROPE ================= //
@@ -229,8 +250,7 @@ func startEurope() {
 		}
 		tuneSocket(localConn)
 
-		go fastPipe(conn, localConn)
-		fastPipe(localConn, conn)
+		proxyConn(conn, localConn)
 	}
 
 	// Dynamic Pool Manager
@@ -316,8 +336,7 @@ func startIran() {
 					// Send target port
 					eConn.Write(obfuscatePort(p, authKey))
 
-					go fastPipe(c, eConn)
-					fastPipe(eConn, c)
+					proxyConn(c, eConn)
 				}(clientConn)
 			}
 		}()
