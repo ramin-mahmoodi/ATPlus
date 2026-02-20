@@ -12,7 +12,7 @@ def print_banner(mode_name):
     CYAN, YELLOW, MAGENTA, BOLD, END = "\033[96m", "\033[93m", "\033[95m", "\033[1m", "\033[0m"
     banner = f"""
 {MAGENTA}{BOLD}###########################################
-#          🚀 AmirTunnel-Pro v2.0         #
+#            🚀 ATPlus v2.0               #
 #      📢 Channel: @Telhost1             #
 ###########################################{END}
 {CYAN}      AMIR

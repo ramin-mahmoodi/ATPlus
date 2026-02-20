@@ -1,58 +1,65 @@
-# AmirTunnel-Pro
-High-performance, Reverse TCP Tunnel with dynamic Xray port synchronization. Designed for maximum speed and intranet-to-internet bridging.
+<div dir="rtl">
 
-Markdown
-# 🚀 AmirTunnel-Pro v2.0 (High Performance & Anti-DPI)
+# 🚀 پروژه ATPlus (نسخه ۲.۰)
 
-High-performance, Reverse TCP Tunnel with dynamic Xray port synchronization. Specifically designed to bypass upload speed restrictions and provide a seamless, secure connection between Iran and External servers.
+یک تونل معکوس (Reverse TCP Tunnel) فوقِ سریع و هوشمند با قابلیت همگام‌سازی دینامیک پورت‌های Xray. این ابزار به صورت تخصصی برای دور زدن محدودیت‌های سرعت آپلود، مخفی‌سازی ترافیک از سیستم‌های فیلترینگ (DPI) و ایجاد یک اتصال پایدار و بدون قطعی بین سرور ایران و سرور خارج (اروپا) طراحی شده است.
 
-## ⚡ Quick Start (Auto-Install & Run in Background)
+---
 
-Use this single command to download the script and run it inside a **Screen** session. This ensures the tunnel keeps running even after you close the terminal.
+## 🌟 امکانات و ویژگی‌های نسخه جدید (v2.0)
+
+- **امنیت کامل و ضد فیلتر (Anti-DPI):** استفاده از یک پسورد مشترک برای احراز هویت سرورها و پنهان‌کردنِ (Obfuscation) هوشمندِ پورت‌ها با الگوریتم رمزنگاری XOR تا سیستم‌های DPI متوجه ترافیک شما نشوند.
+- **استخر هوشمندِ کانکشن‌ها (Dynamic Pool):** جایگزینی ایجاد اجباری ۵۰۰ کانکشن همزمان با یک استخر منعطف که بر اساس بار شبکه از ۲۰ تا ۵۰۰ کانکشن نوسان می‌کند. (جلوگیری از پر شدن RAM و کرش کردنِ سرورهای ضعیف).
+- **حذف کانکشن‌های مرده (Zombies):** با بهره‌گیری از پروتکل پیشرفته TCP Keep-Alive در سطح سوکت، هر اتصالی که از سمت اینترنتِ ایران بصورت ناقص قطع شده باشد، فوراً شناسایی و حذف می‌گردد تا قطعی یا افت سرعتی احساس نکنید.
+- **پردازش سبک و بدون تاخیر (Zero Latency):** حذف ابزارهای سنگینِ لینوکسی مثل `ss` و خواندن مستقیم وضعیت پورت‌ها از مموری هسته لینوکس (`/proc/net/tcp`) برای رساندن میزان درگیری CPU به صفر.
+- **دور زدن SSL:** امکان دانلودِ امن و بدونِ خطایِ سرتیفیکت در شبکه‌های محدود با پرچم `--no-check-certificate`.
+
+---
+
+## ⚡ راهنمای نصب و راه‌اندازی سریع
+
+شما کافیست فقط با اجرای یک دستور ساده، اسکریپت را دانلود کرده و آن را در بک‌گراند (با استفاده از ابزار Screen) اجرا نمایید. 
 
 ```bash
-wget --no-check-certificate -O AmirTunnelPro.py http://raw.githubusercontent.com/amircpuir/AmirTunnel-Pro/main/AmirTunnelPro.py && screen -S amirtunnel python3 AmirTunnelPro.py
-🛠 How to Use
-1. Setup on Iran Server (Bridge)
-Run the command above and select Option 2 (Iran Server).
+wget --no-check-certificate -O ATPlus.py https://raw.githubusercontent.com/ramin-mahmoodi/ATPlus/main/ATPlus.py && screen -S atplus python3 ATPlus.py
+```
 
-Enter your Tunnel Bridge Port (e.g., 443).
+### ۱. تنظیم سرور ایران (به‌عنوان پل یا Bridge)
+1. ابتدا دستور بالا را درون سرور ایران وارد کنید.
+2. از منوی نمایش داده شده، **گزینه ۲ (Iran Server)** را انتخاب کنید.
+3. یک پورت برای ایجاد پل ارتباطی وارد کنید (مثلا `443` یا `8443`).
+4. یک پورت جهت سینکِ اطلاعات وارد کنید (مثلا `444`).
+5. **مهم:** یک رمز عبورِ ایمن (Secret Password) تعیین کنید. (مثلا `my_secure_pass123`) - این رمز باید در سرور خارج هم عیناً استفاده شود.
+6. در نهایت برای همگام‌سازی خودکار پورت‌های Xray، حرف `y` را بزنید؛ یا برای ورود دستی `n` را بفشارید.
 
-Enter your Port Sync Port (e.g., 444).
+### ۲. تنظیم سرور خارج (اروپا / مقصـد)
+1. مجددا دستور بالا را درون سرور خارج خود بزنید.
+2. این‌بار از منو، **گزینه ۱ (Europe Server)** را انتخاب کنید.
+3. آی‌پی (IP) سرور ایران خود را وارد نمایید.
+4. همان پورت پل (مثلا `443`) و پورت سینک (مثلا `444`) که در سرور ایران زدید را وارد کنید.
+5. همان **رمز عبوری** که در سرور ایران تعیین کردید را اینجا نیز وارد کنید.
 
-Enter a Secret Password (e.g., `mylongpassword123`). This keeps your tunnel safe from scanners and DPI.
+تمام! تونل شما با بالاترین امنیت در حال کار است.
 
-Choose y for Auto-Sync or n for Manual Entry.
+---
 
-2. Setup on Europe Server (Exit)
-Run the command above and select Option 1 (Europe Server).
+## 📺 نحوه مدیریت اجرای اسکریپت (Screen)
 
-Enter your Iran Server IP.
+از آنجایی که اسکریپت درون یک نشستِ لاگین مجازی به نام `atplus` اجرا می‌شود، حتی پس از بستنِ ترمینال نیز به کار خود ادامه می‌دهد.
 
-Use the same ports you configured on the Iran server.
+- **برای خروج از صفحه (بدون بستن تونل):** کلید `Ctrl + A` و سپس کلید `D` را بزنید.
+- **برای بازگشت به صفحه اسکریپت:** دستور `screen -r atplus` را در ترمینال وارد کنید.
+- **برای متوقف کردن و بستن کامل تونل:** دستور `screen -XS atplus quit` را وارد کنید.
 
-📺 Managing your Session (Screen Commands)
-Since the script runs inside a "Screen" session named amirtunnel:
+---
 
-To Detach: Press Ctrl + A then D (This leaves the tunnel running in the background).
+## 🔧 عیب‌یابی (Troubleshooting)
 
-To Re-attach: Run screen -r amirtunnel to see the logs and the menu again.
+اگر هنگام اجرای اسکریپت با خطای **Address already in use** مواجه شدید، به این معنی است که نسخه قبلیِ اسکریپت هنوز در پس‌زمینه در حال کار است و پورت‌ها را اشغال کرده.
+برای بستنِ تمامی پروسس‌های مرتبط در سرور، دستور زیر را اجرا کنید:
 
-To Kill: Run screen -XS amirtunnel quit.
-
-🚀 Key Features (v2.0)
-Security & Anti-DPI: Uses a Secret Password to authenticate servers and XOR obfuscation to hide target ports from DPI inspection.
-
-Dynamic Connection Pool: Automatically scales connections based on demand (from 20 up to 500) to save RAM and avoid suspicion.
-
-TCP Keep-Alive: Actively drops dead/zombie sessions to ensure a 100% reliable connection.
-
-Persistence: Runs in a screen session to prevent disconnection issues.
-
-Zero Latency: Re-written core logic minimizes CPU usage and removes subprocess overheads.
-
-🔧 Troubleshooting
-If you see Address already in use, it means a previous session is still holding the ports. Kill all python processes using:
-
-Bash
+```bash
 pkill -f python3
+```
+
+</div>
