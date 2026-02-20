@@ -565,6 +565,7 @@ func generateDummyCert() (tls.Certificate, error) {
 
 func main() {
 	mRand.Seed(time.Now().UnixNano())
+	flag.Parse()
 
 	if mode == "europe" {
 		startEurope()
