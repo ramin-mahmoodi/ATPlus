@@ -47,6 +47,10 @@ cd /usr/local/src/atplus
 rm -f go.mod go.sum main.go
 go mod init atplus
 
+echo "[+] Bypassing DNS blocks for Go modules..."
+export GOPROXY=direct,https://goproxy.io,https://goproxy.cn
+go env -w GOPROXY=direct,https://goproxy.io,https://goproxy.cn
+
 echo "[+] Downloading Anti-DPI dependencies..."
 go get github.com/xtaci/smux
 go get github.com/refraction-networking/utls
