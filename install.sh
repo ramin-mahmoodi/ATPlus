@@ -51,9 +51,8 @@ echo "[+] Bypassing DNS blocks for Go modules..."
 export GOPROXY=direct,https://goproxy.io,https://goproxy.cn
 go env -w GOPROXY=direct,https://goproxy.io,https://goproxy.cn
 
-echo "[+] Downloading Anti-DPI dependencies..."
+echo "[+] Downloading Multiplexing dependencies..."
 go get github.com/xtaci/smux
-go get github.com/refraction-networking/utls
 
 echo "[+] Generating ATPlus Source Code..."
 cat > /usr/local/src/atplus/main.go << 'EOF'
@@ -61,25 +60,15 @@ package main
 
 import (
 	"crypto/md5"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
-	"encoding/pem"
-	"crypto/rsa"
-	"crypto/rand"
-	"math/big"
 	"flag"
 	"fmt"
 	"io"
-	mRand "math/rand"
-	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/smux"
 )
 
@@ -123,7 +112,7 @@ func init() {
 func printBanner(m string) {
 	fmt.Print("\033[H\033[2J")
 	banner := fmt.Sprintf(`%s%s###########################################
-#          🚀 ATPlus v4.0 (Anti-DPI)      #
+#          🚀 ATPlus v4.1 (SMUX Raw)      #
 #      📢 Channel: @Telhost1             #
 ###########################################%s
 %s      AMIR
@@ -136,9 +125,8 @@ func printBanner(m string) {
   \__________/           %s  (__|___|__)%s
     %sHorned Man%s             %s    Linux Tux%s
 %s[+] Multiplexing (Smux) Engine Active
-[+] uTLS Browser Fingerprinting Active
-[+] Hardware-level Fragmentation & Padding
-[+] Zero-Copy I/O Engine (Golang)
+[+] Zero-Copy Memory Pools
+[+] CPU-Optimized RAW Tunnel (No TLS Double-Encrypt)
 [+] Mode: %s%s
 -------------------------------------------
 `,
@@ -188,68 +176,24 @@ func fastPipe(src net.Conn, dst net.Conn) {
 }
 
 // ----------------------------------------------------
-// ANTI-DPI WRAPPERS
+// MULTIPLEXER FACTORY
 // ----------------------------------------------------
-
-type FragmentedConn struct {
-	net.Conn
-	handshakeDone bool
-	mu            sync.Mutex
-}
-
-func (fc *FragmentedConn) Write(b []byte) (n int, err error) {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-
-	if !fc.handshakeDone && len(b) > 40 {
-		split := 64 + mRand.Intn(86)
-		if split > len(b) {
-			split = len(b) / 2
-		}
-		
-		n1, err := fc.Conn.Write(b[:split])
-		if err != nil {
-			return n1, err
-		}
-		
-		time.Sleep(time.Duration(1+mRand.Intn(2)) * time.Millisecond)
-		
-		n2, err := fc.Conn.Write(b[split:])
-		fc.handshakeDone = true
-		return n1 + n2, err
-	}
-	
-	fc.handshakeDone = true
-	return fc.Conn.Write(b)
-}
 
 func createEuropeMultiplexer() (*smux.Session, error) {
 	rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, bridgePort), 5*time.Second)
 	if err != nil { return nil, err }
 	tuneSocket(rawConn)
 
-	fragConn := &FragmentedConn{Conn: rawConn}
-
-	config := &utls.Config{
-		ServerName:         "www.google.com",
-		InsecureSkipVerify: true,
-	}
-	tlsConn := utls.UClient(fragConn, config, utls.HelloChrome_120)
-	if err = tlsConn.Handshake(); err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-
-	tlsConn.Write(authKey)
+	rawConn.Write(authKey)
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = 4194304 * 2
 	smuxConfig.MaxStreamBuffer = 4194304
 	smuxConfig.KeepAliveInterval = 10 * time.Second
 	smuxConfig.KeepAliveTimeout = 30 * time.Second
-	session, err := smux.Client(tlsConn, smuxConfig)
+	session, err := smux.Client(rawConn, smuxConfig)
 	if err != nil {
-		tlsConn.Close()
+		rawConn.Close()
 		return nil, err
 	}
 
@@ -358,22 +302,18 @@ func startEurope() {
 		for {
 			if rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, syncPort), 5*time.Second); err == nil {
 				tuneSocket(rawConn)
-				fragConn := &FragmentedConn{Conn: rawConn}
-				tlsConn := utls.UClient(fragConn, &utls.Config{ServerName: "www.google.com", InsecureSkipVerify: true}, utls.HelloChrome_120)
 				
-				if tlsConn.Handshake() == nil {
-					tlsConn.Write(authKey)
+				rawConn.Write(authKey)
 
-					ports := getXrayPorts()
-					count := len(ports)
-					if count > 255 { count = 255 }
-					buf := []byte{byte(count)}
-					for i := 0; i < count; i++ {
-						buf = append(buf, obfuscatePort(ports[i], authKey)...)
-					}
-					tlsConn.Write(buf)
+				ports := getXrayPorts()
+				count := len(ports)
+				if count > 255 { count = 255 }
+				buf := []byte{byte(count)}
+				for i := 0; i < count; i++ {
+					buf = append(buf, obfuscatePort(ports[i], authKey)...)
 				}
-				tlsConn.Close()
+				rawConn.Write(buf)
+				rawConn.Close()
 			}
 			time.Sleep(5 * time.Second)
 		}
@@ -445,12 +385,14 @@ func startIran() {
 				go func(c net.Conn) {
 					poolMu.Lock()
 					poolSize := len(sessionPool)
-					if poolSize == 0 {
+					if len(sessionPool) == 0 {
 						poolMu.Unlock()
 						c.Close()
 						return
 					}
-					sess := sessionPool[mRand.Intn(poolSize)]
+					// Use round-robin instead of rand for better load balancing
+					sess := sessionPool[0]
+					sessionPool = append(sessionPool[1:], sess)
 					poolMu.Unlock()
 
 					stream, err := sess.OpenStream()
@@ -460,10 +402,6 @@ func startIran() {
 					}
 
 					stream.Write(obfuscatePort(p, authKey))
-
-					if mRand.Intn(100) < 5 {
-						// Decoy Simulation injected locally into stream metrics implicitly
-					}
 
 					go fastPipe(c, stream)
 					fastPipe(stream, c)
@@ -489,41 +427,32 @@ func startIran() {
 		if err != nil { return }
 		fmt.Printf("🔍 Auto-Sync Active on port %d\n", syncPort)
 
-		cert, _ := generateDummyCert()
-		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-
 		for {
 			rawConn, err := listener.Accept()
 			if err != nil { continue }
 			
 			go func(c net.Conn) {
-				tlsConn := tls.Server(c, tlsConfig)
-				if err := tlsConn.Handshake(); err != nil {
-					tlsConn.Close()
-					return
-				}
-				
 				authBuffer := make([]byte, 16)
-				tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				if _, err := io.ReadFull(tlsConn, authBuffer); err != nil || string(authBuffer) != string(authKey) {
-					tlsConn.Close()
+				c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, err := io.ReadFull(c, authBuffer); err != nil || string(authBuffer) != string(authKey) {
+					c.Close()
 					return
 				}
-				tlsConn.SetReadDeadline(time.Time{})
+				c.SetReadDeadline(time.Time{})
 				
 				countBuf := make([]byte, 1)
-				if _, err := io.ReadFull(tlsConn, countBuf); err != nil { return }
+				if _, err := io.ReadFull(c, countBuf); err != nil { return }
 				
 				count := int(countBuf[0])
 				if count > 0 {
 					pBuf := make([]byte, count*2)
-					if _, err := io.ReadFull(tlsConn, pBuf); err == nil {
+					if _, err := io.ReadFull(c, pBuf); err == nil {
 						for i := 0; i < count; i++ {
 							openNewPort(deobfuscatePort(pBuf[i*2:i*2+2], authKey))
 						}
 					}
 				}
-				tlsConn.Close()
+				c.Close()
 			}(rawConn)
 		}
 	}()
@@ -534,37 +463,29 @@ func startIran() {
 		os.Exit(1)
 	}
 
-	cert, _ := generateDummyCert()
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-
 	for {
 		rawConn, err := bridgeListener.Accept()
 		if err != nil { continue }
 		tuneSocket(rawConn)
 
 		go func(c net.Conn) {
-			tlsConn := tls.Server(c, tlsConfig)
-			if err := tlsConn.Handshake(); err != nil {
-				tlsConn.Close()
-				return
-			}
 			
 			authBuffer := make([]byte, 16)
-			tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, err := io.ReadFull(tlsConn, authBuffer); err != nil || string(authBuffer) != string(authKey) {
-				tlsConn.Close()
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(c, authBuffer); err != nil || string(authBuffer) != string(authKey) {
+				c.Close()
 				return
 			}
-			tlsConn.SetReadDeadline(time.Time{})
+			c.SetReadDeadline(time.Time{})
 			
 			smuxConfig := smux.DefaultConfig()
 			smuxConfig.MaxReceiveBuffer = 4194304 * 2
 			smuxConfig.MaxStreamBuffer = 4194304
 			smuxConfig.KeepAliveInterval = 10 * time.Second
 			smuxConfig.KeepAliveTimeout = 30 * time.Second
-			session, err := smux.Server(tlsConn, smuxConfig)
+			session, err := smux.Server(c, smuxConfig)
 			if err != nil {
-				tlsConn.Close()
+				c.Close()
 				return
 			}
 
@@ -585,21 +506,6 @@ func startIran() {
 			}()
 		}(rawConn)
 	}
-}
-
-func generateDummyCert() (tls.Certificate, error) {
-	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	derBytes, _ := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 func main() {
