@@ -2,6 +2,7 @@ import asyncio
 import os
 import socket
 import struct
+import argparse
 try:
     import resource
 except ImportError:
@@ -92,12 +93,19 @@ async def fast_pipe(reader, writer):
         except Exception:
             pass
 
-async def start_europe():
+async def start_europe(args=None):
     print_banner("EUROPE (XRAY CONNECTOR)")
-    iran_ip = input("[?] Iran IP: ")
-    bridge_p = int(input("[?] Tunnel Bridge Port: "))
-    sync_p = int(input("[?] Port Sync Port: "))
-    password = input("[?] Secret Password (must match Iran): ")
+    
+    if args and args.iran_ip and args.bridge_port and args.sync_port and args.password:
+        iran_ip = args.iran_ip
+        bridge_p = args.bridge_port
+        sync_p = args.sync_port
+        password = args.password
+    else:
+        iran_ip = input("[?] Iran IP: ")
+        bridge_p = int(input("[?] Tunnel Bridge Port: "))
+        sync_p = int(input("[?] Port Sync Port: "))
+        password = input("[?] Secret Password (must match Iran): ")
     
     auth_key = get_auth_key(password)
     active_connections = 0
@@ -220,15 +228,23 @@ async def start_europe():
         pass
 
 
-async def start_iran():
+async def start_iran(args=None):
     print_banner("IRAN (FLEX LISTENER)")
-    bridge_p = int(input("[?] Tunnel Bridge Port: "))
-    sync_p = int(input("[?] Port Sync Port: "))
-    password = input("[?] Secret Password (must match Europe): ")
+    
+    if args and args.bridge_port and args.sync_port and args.password:
+        bridge_p = args.bridge_port
+        sync_p = args.sync_port
+        password = args.password
+        is_auto = args.auto_sync if args.auto_sync is not None else True
+        manual_ports_str = args.manual_ports
+    else:
+        bridge_p = int(input("[?] Tunnel Bridge Port: "))
+        sync_p = int(input("[?] Port Sync Port: "))
+        password = input("[?] Secret Password (must match Europe): ")
+        is_auto = input("[?] Do you want Auto-Sync Xray ports? (y/n): ").lower() == 'y'
+        manual_ports_str = None
     
     auth_key = get_auth_key(password)
-    
-    is_auto = input("[?] Do you want Auto-Sync Xray ports? (y/n): ").lower() == 'y'
     
     connection_pool = asyncio.Queue()
     active_servers = {} 
@@ -322,7 +338,9 @@ async def start_iran():
         await asyncio.start_server(handle_sync_conn, '0.0.0.0', sync_p, backlog=100)
         print(f"🔍 Auto-Sync Active on port {sync_p}")
     else:
-        manual_ports = input("[?] Enter ports manually (e.g. 80,443,2083): ").split(',')
+        if not manual_ports_str:
+            manual_ports_str = input("[?] Enter ports manually (e.g. 80,443,2083): ")
+        manual_ports = manual_ports_str.split(',')
         for p_str in manual_ports:
             if p_str.strip().isdigit():
                 await open_new_port(int(p_str.strip()))
@@ -335,9 +353,26 @@ async def start_iran():
 
 if __name__ == "__main__":
     optimize_system()
-    print("1) Europe Server\n2) Iran Server")
-    choice = input("Choice: ")
-    if choice == '1': 
-        asyncio.run(start_europe())
-    else: 
-        asyncio.run(start_iran())
+    
+    parser = argparse.ArgumentParser(description="ATPlus - High Performance Reverse TCP Tunnel")
+    parser.add_argument("--mode", choices=['europe', 'iran'], help="Server mode")
+    parser.add_argument("--iran-ip", help="Iran Server IP (for Europe mode)")
+    parser.add_argument("--bridge-port", type=int, help="Tunnel Bridge Port")
+    parser.add_argument("--sync-port", type=int, help="Port Sync Port")
+    parser.add_argument("--password", help="Secret Password")
+    parser.add_argument("--auto-sync", type=bool, nargs='?', const=True, default=None, help="Enable Auto-Sync Xray ports")
+    parser.add_argument("--manual-ports", help="Comma separated ports for manual entry")
+    
+    args, unknown = parser.parse_known_args()
+    
+    if args.mode == 'europe':
+        asyncio.run(start_europe(args))
+    elif args.mode == 'iran':
+        asyncio.run(start_iran(args))
+    else:
+        print("1) Europe Server\n2) Iran Server")
+        choice = input("Choice: ")
+        if choice == '1': 
+            asyncio.run(start_europe())
+        else: 
+            asyncio.run(start_iran())
