@@ -18,11 +18,16 @@ systemctl stop atplus 2>/dev/null
 echo "[+] Checking for Golang compiler..."
 if ! command -v go &> /dev/null; then
     echo "[-] Go is not installed. Installing Go..."
-    # Try Snap first (Ubuntu/Debian standard)
+    
+    # Attempt 1: Snap
     if command -v snap &> /dev/null; then
+        echo "[+] Attempting to install via snap..."
         snap install go --classic
-    else
-        # Fallback to direct tarball download (OS independent)
+    fi
+
+    # Attempt 2: Direct Tarball (If snap failed or doesn't exist)
+    if ! command -v go &> /dev/null; then
+        echo "[+] Snap failed or unavailable. Falling back to official Go binaries..."
         cd /tmp
         wget -q -O go.tar.gz https://go.dev/dl/go1.22.1.linux-amd64.tar.gz
         rm -rf /usr/local/go
