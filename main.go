@@ -98,8 +98,6 @@ func deobfuscatePort(obfuscated []byte, key []byte) uint16 {
 func tuneSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(4194304)
-		tcpConn.SetWriteBuffer(4194304)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
