@@ -18,15 +18,23 @@ systemctl stop atplus 2>/dev/null
 echo "[+] Checking for Golang compiler..."
 if ! command -v go &> /dev/null; then
     echo "[-] Go is not installed. Installing Go..."
-    if [ -x "$(command -v apt-get)" ]; then
-        apt-get update && apt-get install -y golang
-    elif [ -x "$(command -v yum)" ]; then
-        yum install -y golang
+    # Try Snap first (Ubuntu/Debian standard)
+    if command -v snap &> /dev/null; then
+        snap install go --classic
     else
-        echo "[-] Error: Unsupported package manager. Please install 'golang' manually."
-        exit 1
+        # Fallback to direct tarball download (OS independent)
+        cd /tmp
+        wget -q -O go.tar.gz https://go.dev/dl/go1.22.1.linux-amd64.tar.gz
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf go.tar.gz
+        export PATH=$PATH:/usr/local/go/bin
+        echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.profile
+        echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
     fi
 fi
+
+# Ensure go is in path for the current shell session
+export PATH=$PATH:/usr/local/go/bin
 
 echo "[+] Initializing Go Module..."
 mkdir -p /usr/local/src/atplus
