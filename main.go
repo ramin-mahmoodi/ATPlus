@@ -103,6 +103,10 @@ func tuneSocket(conn net.Conn) {
 	}
 }
 
+type writerOnly struct {
+	io.Writer
+}
+
 func proxyConn(c1, c2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -110,7 +114,8 @@ func proxyConn(c1, c2 net.Conn) {
 	copySide := func(dst, src net.Conn) {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
-		io.CopyBuffer(dst, src, buf)
+		// Wrap dst to hide io.ReaderFrom and disable kernel splice
+		io.CopyBuffer(writerOnly{dst}, src, buf)
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
