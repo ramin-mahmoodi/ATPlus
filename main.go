@@ -109,17 +109,12 @@ func proxyConn(c1, c2 net.Conn) {
 
 	copySide := func(dst, src net.Conn) {
 		defer wg.Done()
-		buf := make([]byte, 64*1024)
-		io.CopyBuffer(dst, src, buf)
+		io.Copy(dst, src)
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
-		} else {
-			dst.Close()
 		}
 		if tc, ok := src.(*net.TCPConn); ok {
 			tc.CloseRead()
-		} else {
-			src.Close()
 		}
 	}
 
