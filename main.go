@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/xtaci/smux"
 )
 
 var (
@@ -31,8 +33,15 @@ var (
 	bold    = "\033[1m"
 	reset   = "\033[0m"
 
-	minConnections = 100
-	maxConnections = 1000
+	poolMu         sync.Mutex
+	sessionPool    []*smux.Session
+	maxSmuxTunnels = 16
+
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32768)
+		},
+	}
 )
 
 func init() {
@@ -46,9 +55,9 @@ func init() {
 }
 
 func printBanner(m string) {
-	fmt.Print("\033[H\033[2J") // Clear screen
+	fmt.Print("\033[H\033[2J")
 	banner := fmt.Sprintf(`%s%s###########################################
-#            🚀 ATPlus v3.0 (Go)          #
+#          🚀 ATPlus v4.1 (SMUX Raw)      #
 #      📢 Channel: @Telhost1             #
 ###########################################%s
 %s      AMIR
@@ -60,9 +69,9 @@ func printBanner(m string) {
  \            /          %s   / /   \ \
   \__________/           %s  (__|___|__)%s
     %sHorned Man%s             %s    Linux Tux%s
-%s[+] Authentication & XOR Obfuscation Enabled
-[+] Dynamic Pool & Health Checks Active
-[+] Zero-Copy I/O Engine (Golang)
+%s[+] Multiplexing (Smux) Engine Active
+[+] Zero-Copy Memory Pools
+[+] CPU-Optimized RAW Tunnel (No TLS Double-Encrypt)
 [+] Mode: %s%s
 -------------------------------------------
 `,
@@ -99,56 +108,59 @@ func tuneSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
 
-func proxyConn(c1, c2 net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	copySide := func(dst, src net.Conn) {
-		defer wg.Done()
-		io.Copy(dst, src)
-		if tc, ok := dst.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-		if tc, ok := src.(*net.TCPConn); ok {
-			tc.CloseRead()
-		}
-	}
-
-	go copySide(c1, c2)
-	go copySide(c2, c1)
-
-	wg.Wait()
-	c1.Close()
-	c2.Close()
+func fastPipe(src net.Conn, dst net.Conn) {
+	buf := bufferPool.Get().([]byte)
+	io.CopyBuffer(dst, src, buf)
+	bufferPool.Put(buf)
+	src.Close()
+	dst.Close()
 }
 
-// ================= EUROPE ================= //
+// ----------------------------------------------------
+// MULTIPLEXER FACTORY
+// ----------------------------------------------------
+
+func createEuropeMultiplexer() (*smux.Session, error) {
+	rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, bridgePort), 5*time.Second)
+	if err != nil { return nil, err }
+	tuneSocket(rawConn)
+
+	rawConn.Write(authKey)
+
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.MaxReceiveBuffer = 4194304 * 2
+	smuxConfig.MaxStreamBuffer = 4194304
+	smuxConfig.KeepAliveInterval = 10 * time.Second
+	smuxConfig.KeepAliveTimeout = 30 * time.Second
+	session, err := smux.Client(rawConn, smuxConfig)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+
+	return session, nil
+}
+
+// ----------------------------------------------------
+// EUROPE
+// ----------------------------------------------------
 
 func getXrayPorts() []uint16 {
 	portSet := make(map[uint16]bool)
-	files := []string{"/proc/net/tcp", "/proc/net/tcp6"}
-	for _, file := range files {
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		data, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		lines := strings.Split(string(data), "\n")
-		for i, line := range lines {
-			if i == 0 || len(line) == 0 {
-				continue
-			}
+		for _, line := range lines {
 			parts := strings.Fields(line)
-			if len(parts) >= 4 && parts[3] == "0A" { // 0A = LISTEN
-				localAddr := parts[1]
-				addrParts := strings.Split(localAddr, ":")
+			if len(parts) >= 4 && parts[3] == "0A" {
+				addrParts := strings.Split(parts[1], ":")
 				if len(addrParts) == 2 {
-					portHex := addrParts[1]
-					port64, err := strconv.ParseUint(portHex, 16, 16)
-					if err == nil {
+					if port64, err := strconv.ParseUint(addrParts[1], 16, 16); err == nil {
 						p := uint16(port64)
 						if p > 100 && p != uint16(bridgePort) && p != uint16(syncPort) {
 							portSet[p] = true
@@ -159,152 +171,149 @@ func getXrayPorts() []uint16 {
 		}
 	}
 	var ports []uint16
-	for p := range portSet {
-		ports = append(ports, p)
-	}
+	for p := range portSet { ports = append(ports, p) }
 	return ports
 }
 
 func startEurope() {
 	if iranIP == "" || bridgePort == 0 || syncPort == 0 || password == "" {
-		fmt.Println("Missing arguments for Europe mode. Ensure --iran-ip, --bridge-port, --sync-port, and --password are provided.")
+		fmt.Println("Missing arguments for Europe mode.")
 		os.Exit(1)
 	}
 	printBanner("EUROPE (XRAY CONNECTOR)")
 	authKey = getAuthKey(password)
 
-	activeConnections := 0
-	var mu sync.Mutex
-
-	// Port Sync Task
 	go func() {
 		for {
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, syncPort), 5*time.Second)
-			if err == nil {
-				tuneSocket(conn)
-				conn.Write(authKey)
+			time.Sleep(10 * time.Minute)
+			poolMu.Lock()
+			if len(sessionPool) > 0 {
+				oldSession := sessionPool[0]
+				sessionPool = sessionPool[1:]
+				poolMu.Unlock()
+				oldSession.Close()
+			} else {
+				poolMu.Unlock()
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			poolMu.Lock()
+			currentLinks := len(sessionPool)
+			poolMu.Unlock()
+
+			if currentLinks < maxSmuxTunnels {
+				var wg sync.WaitGroup
+				needed := maxSmuxTunnels - currentLinks
+				for i := 0; i < needed; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if session, err := createEuropeMultiplexer(); err == nil {
+							poolMu.Lock()
+							if len(sessionPool) < maxSmuxTunnels {
+								sessionPool = append(sessionPool, session)
+								go func(sess *smux.Session) {
+									for {
+										stream, err := sess.AcceptStream()
+										if err != nil { break }
+										go handleEuropeStream(stream)
+									}
+									poolMu.Lock()
+									for k, s := range sessionPool {
+										if s == sess {
+											sessionPool = append(sessionPool[:k], sessionPool[k+1:]...)
+											break
+										}
+									}
+									poolMu.Unlock()
+								}(session)
+							} else {
+								session.Close()
+							}
+							poolMu.Unlock()
+						}
+					}()
+				}
+				wg.Wait()
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		for {
+			if rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, syncPort), 5*time.Second); err == nil {
+				tuneSocket(rawConn)
+				
+				rawConn.Write(authKey)
 
 				ports := getXrayPorts()
-				// Max ports we can send in one uint8 is 255. If > 255 we truncate for safety.
 				count := len(ports)
-				if count > 255 {
-					count = 255
-				}
+				if count > 255 { count = 255 }
 				buf := []byte{byte(count)}
 				for i := 0; i < count; i++ {
 					buf = append(buf, obfuscatePort(ports[i], authKey)...)
 				}
-				conn.Write(buf)
-				conn.Close()
+				rawConn.Write(buf)
+				rawConn.Close()
 			}
 			time.Sleep(5 * time.Second)
 		}
 	}()
 
-	createReverseLink := func() {
-		defer func() {
-			mu.Lock()
-			activeConnections--
-			if activeConnections < 0 {
-				activeConnections = 0
-			}
-			mu.Unlock()
-		}()
-
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, bridgePort), 5*time.Second)
-		if err != nil {
-			time.Sleep(1 * time.Second)
-			return
-		}
-		tuneSocket(conn)
-
-		// Authenticate
-		conn.Write(authKey)
-
-		mu.Lock()
-		activeConnections++
-		mu.Unlock()
-
-		header := make([]byte, 2)
-		_, err = io.ReadFull(conn, header)
-		if err != nil {
-			conn.Close()
-			return
-		}
-
-		targetPort := deobfuscatePort(header, authKey)
-		if targetPort == 0 {
-			conn.Close()
-			return // Heartbeat ping
-		}
-
-		localConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", targetPort), 5*time.Second)
-		if err != nil {
-			conn.Close()
-			return
-		}
-		tuneSocket(localConn)
-
-		proxyConn(conn, localConn)
-	}
-
-	// Dynamic Pool Manager
-	fmt.Printf("✅ Running... Sync: %d | Bridge: %d | Pool: Dynamic\n", syncPort, bridgePort)
-	for {
-		mu.Lock()
-		current := activeConnections
-		mu.Unlock()
-
-		if current < minConnections {
-			need := minConnections - current
-			for i := 0; i < need; i++ {
-				go createReverseLink()
-			}
-		} else if current < maxConnections {
-			// Add connections rapidly to satisfy high bursts and prevent slow ramp-up
-			for i := 0; i < 10 && (current+i) < maxConnections; i++ {
-				go createReverseLink()
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	fmt.Printf("✅ Running... Sync: %d | Bridge: %d | Multiplexing: Active\n", syncPort, bridgePort)
+	select {}
 }
 
-// ================= IRAN ================= //
+func handleEuropeStream(stream *smux.Stream) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(stream, header); err != nil {
+		stream.Close()
+		return
+	}
+	targetPort := deobfuscatePort(header, authKey)
+	if targetPort == 0 {
+		stream.Close()
+		return
+	}
+
+	localConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", targetPort), 5*time.Second)
+	if err != nil {
+		stream.Close()
+		return
+	}
+	tuneSocket(localConn)
+
+	go fastPipe(stream, localConn)
+	fastPipe(localConn, stream)
+}
+
+// ----------------------------------------------------
+// IRAN
+// ----------------------------------------------------
 
 func startIran() {
 	if bridgePort == 0 || syncPort == 0 || password == "" {
-		fmt.Println("Missing arguments for Iran mode. Ensure --bridge-port, --sync-port, and --password are provided.")
+		fmt.Println("Missing arguments for Iran mode.")
 		os.Exit(1)
 	}
 	printBanner("IRAN (FLEX LISTENER)")
 	authKey = getAuthKey(password)
 
-	connPool := make(chan net.Conn, 10000)
 	activePorts := make(map[uint16]bool)
 	var activePortsMu sync.Mutex
 
-	// Keep-alive heartbeat to clean dead connections
-	go func() {
-		for {
-			time.Sleep(20 * time.Second)
-			// Send dummy pings to connections in the pool to verify them occasionally (Optional, advanced pooling)
-			// In Go, TCP keep-alives usually handle this at the OS level, but we can do a simple queue wash if needed.
-		}
-	}()
-
 	openNewPort := func(p uint16) {
 		activePortsMu.Lock()
-		if activePorts[p] {
-			activePortsMu.Unlock()
-			return
-		}
+		if activePorts[p] { activePortsMu.Unlock(); return }
 		activePorts[p] = true
 		activePortsMu.Unlock()
 
 		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", p))
 		if err != nil {
-			fmt.Printf("❌ Error opening port %d: %v\n", p, err)
 			activePortsMu.Lock()
 			activePorts[p] = false
 			activePortsMu.Unlock()
@@ -315,36 +324,42 @@ func startIran() {
 		go func() {
 			for {
 				clientConn, err := listener.Accept()
-				if err != nil {
-					continue
-				}
+				if err != nil { continue }
 				tuneSocket(clientConn)
 
 				go func(c net.Conn) {
-					// Get valid Europe connection
-					eConn, ok := <-connPool
-					if !ok {
+					poolMu.Lock()
+					poolSize := len(sessionPool)
+					if len(sessionPool) == 0 {
+						poolMu.Unlock()
+						c.Close()
+						return
+					}
+					// Use round-robin instead of rand for better load balancing
+					sess := sessionPool[0]
+					sessionPool = append(sessionPool[1:], sess)
+					poolMu.Unlock()
+
+					stream, err := sess.OpenStream()
+					if err != nil {
 						c.Close()
 						return
 					}
 
-					// Send target port
-					eConn.Write(obfuscatePort(p, authKey))
+					stream.Write(obfuscatePort(p, authKey))
 
-					proxyConn(c, eConn)
+					go fastPipe(c, stream)
+					fastPipe(stream, c)
 				}(clientConn)
 			}
 		}()
 	}
 
-	// Sync Listener
 	go func() {
 		if !autoSync {
 			if manualPorts != "" {
-				mPorts := strings.Split(manualPorts, ",")
-				for _, pStr := range mPorts {
-					p, err := strconv.Atoi(strings.TrimSpace(pStr))
-					if err == nil {
+				for _, pStr := range strings.Split(manualPorts, ",") {
+					if p, err := strconv.Atoi(strings.TrimSpace(pStr)); err == nil {
 						openNewPort(uint16(p))
 					}
 				}
@@ -354,48 +369,39 @@ func startIran() {
 		}
 
 		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", syncPort))
-		if err != nil {
-			fmt.Printf("❌ Sync port error: %v\n", err)
-			return
-		}
+		if err != nil { return }
 		fmt.Printf("🔍 Auto-Sync Active on port %d\n", syncPort)
 
 		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				continue
-			}
+			rawConn, err := listener.Accept()
+			if err != nil { continue }
+			
 			go func(c net.Conn) {
-				defer c.Close()
 				authBuffer := make([]byte, 16)
 				c.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, err := io.ReadFull(c, authBuffer)
-				if err != nil || string(authBuffer) != string(authKey) {
+				if _, err := io.ReadFull(c, authBuffer); err != nil || string(authBuffer) != string(authKey) {
+					c.Close()
 					return
 				}
-
+				c.SetReadDeadline(time.Time{})
+				
 				countBuf := make([]byte, 1)
-				_, err = io.ReadFull(c, countBuf)
-				if err != nil {
-					return
-				}
+				if _, err := io.ReadFull(c, countBuf); err != nil { return }
+				
 				count := int(countBuf[0])
 				if count > 0 {
 					pBuf := make([]byte, count*2)
-					_, err = io.ReadFull(c, pBuf)
-					if err != nil {
-						return
-					}
-					for i := 0; i < count; i++ {
-						p := deobfuscatePort(pBuf[i*2:i*2+2], authKey)
-						openNewPort(p)
+					if _, err := io.ReadFull(c, pBuf); err == nil {
+						for i := 0; i < count; i++ {
+							openNewPort(deobfuscatePort(pBuf[i*2:i*2+2], authKey))
+						}
 					}
 				}
-			}(conn)
+				c.Close()
+			}(rawConn)
 		}
 	}()
 
-	// Bridge Listener
 	bridgeListener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", bridgePort))
 	if err != nil {
 		fmt.Printf("❌ Bridge listener error: %v\n", err)
@@ -403,38 +409,53 @@ func startIran() {
 	}
 
 	for {
-		conn, err := bridgeListener.Accept()
-		if err != nil {
-			continue
-		}
-		tuneSocket(conn)
+		rawConn, err := bridgeListener.Accept()
+		if err != nil { continue }
+		tuneSocket(rawConn)
 
 		go func(c net.Conn) {
+			
 			authBuffer := make([]byte, 16)
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
-			_, err := io.ReadFull(c, authBuffer)
-			if err != nil || string(authBuffer) != string(authKey) {
+			if _, err := io.ReadFull(c, authBuffer); err != nil || string(authBuffer) != string(authKey) {
+				c.Close()
+				return
+			}
+			c.SetReadDeadline(time.Time{})
+			
+			smuxConfig := smux.DefaultConfig()
+			smuxConfig.MaxReceiveBuffer = 4194304 * 2
+			smuxConfig.MaxStreamBuffer = 4194304
+			smuxConfig.KeepAliveInterval = 10 * time.Second
+			smuxConfig.KeepAliveTimeout = 30 * time.Second
+			session, err := smux.Server(c, smuxConfig)
+			if err != nil {
 				c.Close()
 				return
 			}
 
-			// Remove deadline after auth
-			c.SetReadDeadline(time.Time{})
-
-			select {
-			case connPool <- c:
-				// Successfully pooled
-			default:
-				// If the pool is literally full (10,000 conns), drop it
-				c.Close()
-			}
-		}(conn)
+			poolMu.Lock()
+			sessionPool = append(sessionPool, session)
+			poolMu.Unlock()
+			
+			go func() {
+				<-session.CloseChan()
+				poolMu.Lock()
+				for i, s := range sessionPool {
+					if s == session {
+						sessionPool = append(sessionPool[:i], sessionPool[i+1:]...)
+						break
+					}
+				}
+				poolMu.Unlock()
+			}()
+		}(rawConn)
 	}
 }
 
 func main() {
-	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
+	flag.Parse()
 
 	if mode == "europe" {
 		startEurope()
@@ -477,6 +498,3 @@ func main() {
 				fmt.Scanln(&manualPorts)
 			}
 			startIran()
-		}
-	}
-}

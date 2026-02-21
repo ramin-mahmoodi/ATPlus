@@ -64,6 +64,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -509,7 +512,7 @@ func startIran() {
 }
 
 func main() {
-	mRand.Seed(time.Now().UnixNano())
+	rand.Seed(time.Now().UnixNano())
 	flag.Parse()
 
 	if mode == "europe" {
