@@ -155,8 +155,9 @@ echo "[+] Bypassing DNS blocks for Go modules..."
 export GOPROXY=direct,https://goproxy.io,https://goproxy.cn
 go env -w GOPROXY=direct,https://goproxy.io,https://goproxy.cn
 
-echo "[+] Downloading Multiplexing dependencies..."
+echo "[+] Downloading dependencies..."
 go get github.com/xtaci/smux
+go get github.com/refraction-networking/utls
 
 echo "[+] Generating ATPlus Source Code..."
 cat > /usr/local/src/atplus/main.go << 'EOF'
