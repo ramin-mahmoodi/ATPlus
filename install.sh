@@ -60,11 +60,17 @@ package main
 
 import (
 	"crypto/md5"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/big"
+	mRand "math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -72,6 +78,7 @@ import (
 	"sync"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/smux"
 )
 
@@ -83,6 +90,7 @@ var (
 	password    string
 	autoSync    bool
 	manualPorts string
+	antiDpi     bool
 
 	authKey []byte
 	cyan    = "\033[96m"
@@ -110,6 +118,7 @@ func init() {
 	flag.StringVar(&password, "password", "", "Secret Password")
 	flag.BoolVar(&autoSync, "auto-sync", false, "Enable Auto-Sync Xray ports (Iran mode)")
 	flag.StringVar(&manualPorts, "manual-ports", "", "Comma separated ports for manual entry")
+	flag.BoolVar(&antiDpi, "anti-dpi", false, "Enable uTLS, Fragmentation & HTTP Decoy")
 }
 
 func printBanner(m string) {
@@ -139,6 +148,11 @@ func printBanner(m string) {
 		yellow, yellow, reset,
 		cyan, reset, yellow, reset,
 		bold, m, reset)
+	if antiDpi {
+		banner += fmt.Sprintf("%s[+] ANTI-DPI MODE: uTLS + TLS Frag + HTTP Decoy ACTIVE%s\n", yellow, reset)
+	} else {
+		banner += fmt.Sprintf("%s[+] RAW MODE: Max Speed (No Anti-DPI)%s\n", cyan, reset)
+	}
 	fmt.Print(banner)
 }
 
@@ -179,24 +193,113 @@ func fastPipe(src net.Conn, dst net.Conn) {
 }
 
 // ----------------------------------------------------
+// ANTI-DPI UTILS
+// ----------------------------------------------------
+
+type fragConn struct {
+	net.Conn
+}
+
+func (c *fragConn) Write(b []byte) (n int, err error) {
+	if len(b) > 50 {
+		chunks := [][]byte{
+			b[:10],
+			b[10:30],
+			b[30:50],
+			b[50:],
+		}
+		for _, chunk := range chunks {
+			nn, err := c.Conn.Write(chunk)
+			n += nn
+			if err != nil {
+				return n, err
+			}
+			time.Sleep(2 * time.Millisecond) // micro-delay
+		}
+		return n, nil
+	}
+	return c.Conn.Write(b)
+}
+
+func generateDummyCert() (tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Cloudflare, Inc."},
+			CommonName:   "www.cloudflare.com",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+	}, nil
+}
+
+// ----------------------------------------------------
 // MULTIPLEXER FACTORY
 // ----------------------------------------------------
 
 func createEuropeMultiplexer() (*smux.Session, error) {
 	rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, bridgePort), 5*time.Second)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	tuneSocket(rawConn)
 
-	rawConn.Write(authKey)
+	var transportConn net.Conn = rawConn
+
+	if antiDpi {
+		fConn := &fragConn{rawConn}
+		config := &utls.Config{ServerName: "www.google.com", InsecureSkipVerify: true}
+		tlsConn := utls.UClient(fConn, config, utls.HelloChrome_120)
+
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+
+		// HTTP Decoy
+		decoyReq := "GET / HTTP/1.1\r\nHost: www.google.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: upgrade\r\n\r\n"
+		tlsConn.Write([]byte(decoyReq))
+
+		transportConn = tlsConn
+	}
+
+	transportConn.Write(authKey)
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = 4194304 * 2
 	smuxConfig.MaxStreamBuffer = 4194304
 	smuxConfig.KeepAliveInterval = 10 * time.Second
 	smuxConfig.KeepAliveTimeout = 30 * time.Second
-	session, err := smux.Client(rawConn, smuxConfig)
+	session, err := smux.Client(transportConn, smuxConfig)
 	if err != nil {
-		rawConn.Close()
+		transportConn.Close()
 		return nil, err
 	}
 
@@ -211,7 +314,9 @@ func getXrayPorts() []uint16 {
 	portSet := make(map[uint16]bool)
 	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		data, err := os.ReadFile(file)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			parts := strings.Fields(line)
@@ -229,7 +334,9 @@ func getXrayPorts() []uint16 {
 		}
 	}
 	var ports []uint16
-	for p := range portSet { ports = append(ports, p) }
+	for p := range portSet {
+		ports = append(ports, p)
+	}
 	return ports
 }
 
@@ -276,7 +383,9 @@ func startEurope() {
 								go func(sess *smux.Session) {
 									for {
 										stream, err := sess.AcceptStream()
-										if err != nil { break }
+										if err != nil {
+											break
+										}
 										go handleEuropeStream(stream)
 									}
 									poolMu.Lock()
@@ -305,12 +414,14 @@ func startEurope() {
 		for {
 			if rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, syncPort), 5*time.Second); err == nil {
 				tuneSocket(rawConn)
-				
+
 				rawConn.Write(authKey)
 
 				ports := getXrayPorts()
 				count := len(ports)
-				if count > 255 { count = 255 }
+				if count > 255 {
+					count = 255
+				}
 				buf := []byte{byte(count)}
 				for i := 0; i < count; i++ {
 					buf = append(buf, obfuscatePort(ports[i], authKey)...)
@@ -366,7 +477,10 @@ func startIran() {
 
 	openNewPort := func(p uint16) {
 		activePortsMu.Lock()
-		if activePorts[p] { activePortsMu.Unlock(); return }
+		if activePorts[p] {
+			activePortsMu.Unlock()
+			return
+		}
 		activePorts[p] = true
 		activePortsMu.Unlock()
 
@@ -382,7 +496,9 @@ func startIran() {
 		go func() {
 			for {
 				clientConn, err := listener.Accept()
-				if err != nil { continue }
+				if err != nil {
+					continue
+				}
 				tuneSocket(clientConn)
 
 				go func(c net.Conn) {
@@ -426,13 +542,17 @@ func startIran() {
 		}
 
 		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", syncPort))
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		fmt.Printf("🔍 Auto-Sync Active on port %d\n", syncPort)
 
 		for {
 			rawConn, err := listener.Accept()
-			if err != nil { continue }
-			
+			if err != nil {
+				continue
+			}
+
 			go func(c net.Conn) {
 				authBuffer := make([]byte, 16)
 				c.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -441,10 +561,12 @@ func startIran() {
 					return
 				}
 				c.SetReadDeadline(time.Time{})
-				
+
 				countBuf := make([]byte, 1)
-				if _, err := io.ReadFull(c, countBuf); err != nil { return }
-				
+				if _, err := io.ReadFull(c, countBuf); err != nil {
+					return
+				}
+
 				count := int(countBuf[0])
 				if count > 0 {
 					pBuf := make([]byte, count*2)
@@ -467,34 +589,67 @@ func startIran() {
 
 	for {
 		rawConn, err := bridgeListener.Accept()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		tuneSocket(rawConn)
 
 		go func(c net.Conn) {
-			
+
+			var transportConn net.Conn = c
+
+			if antiDpi {
+				cert, err := generateDummyCert()
+				if err != nil {
+					c.Close()
+					return
+				}
+				tlsConfig := &tls.Config{
+					Certificates: []tls.Certificate{cert},
+					MinVersion:   tls.VersionTLS12,
+				}
+				tlsSrv := tls.Server(c, tlsConfig)
+				if err := tlsSrv.Handshake(); err != nil {
+					c.Close()
+					return
+				}
+
+				// Consume HTTP Decoy
+				decoyBuf := make([]byte, 1024)
+				tlsSrv.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, err := tlsSrv.Read(decoyBuf)
+				if err != nil || !strings.Contains(string(decoyBuf[:n]), "GET /") {
+					c.Close()
+					return
+				}
+				tlsSrv.SetReadDeadline(time.Time{})
+
+				transportConn = tlsSrv
+			}
+
 			authBuffer := make([]byte, 16)
-			c.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, err := io.ReadFull(c, authBuffer); err != nil || string(authBuffer) != string(authKey) {
-				c.Close()
+			transportConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(transportConn, authBuffer); err != nil || string(authBuffer) != string(authKey) {
+				transportConn.Close()
 				return
 			}
-			c.SetReadDeadline(time.Time{})
-			
+			transportConn.SetReadDeadline(time.Time{})
+
 			smuxConfig := smux.DefaultConfig()
 			smuxConfig.MaxReceiveBuffer = 4194304 * 2
 			smuxConfig.MaxStreamBuffer = 4194304
 			smuxConfig.KeepAliveInterval = 10 * time.Second
 			smuxConfig.KeepAliveTimeout = 30 * time.Second
-			session, err := smux.Server(c, smuxConfig)
+			session, err := smux.Server(transportConn, smuxConfig)
 			if err != nil {
-				c.Close()
+				transportConn.Close()
 				return
 			}
 
 			poolMu.Lock()
 			sessionPool = append(sessionPool, session)
 			poolMu.Unlock()
-			
+
 			go func() {
 				<-session.CloseChan()
 				poolMu.Lock()
@@ -511,7 +666,7 @@ func startIran() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	mRand.Seed(time.Now().UnixNano())
 	flag.Parse()
 
 	if mode == "europe" {
@@ -577,22 +732,33 @@ echo "1) Europe Server (Exit)"
 echo "2) Iran Server (Bridge)"
 read -p "Choice [1/2]: " SERVER_TYPE
 
+echo ""
+echo "Select Connection Mode:"
+echo "1) Maximum Speed (Raw TCP - No Obfuscation)"
+echo "2) Maximum Security (Anti-DPI - uTLS + Fragmentation + Decoys)"
+read -p "Choice [1/2]: " SECURITY_MODE
+
 read -p "Enter Tunnel Bridge Port (e.g., 443): " BRIDGE_PORT
 read -p "Enter Port Sync Port (e.g., 444): " SYNC_PORT
 read -p "Enter Secret Password (must match on both servers): " PASSWORD
 
+ANTI_DPI_FLAG=""
+if [ "$SECURITY_MODE" == "2" ]; then
+    ANTI_DPI_FLAG="--anti-dpi"
+fi
+
 if [ "$SERVER_TYPE" == "1" ]; then
     MODE="europe"
     read -p "Enter Iran Server IP: " IRAN_IP
-    EXEC_CMD="/usr/local/bin/atplus --mode europe --iran-ip $IRAN_IP --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\""
+    EXEC_CMD="/usr/local/bin/atplus --mode europe --iran-ip $IRAN_IP --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" $ANTI_DPI_FLAG"
 elif [ "$SERVER_TYPE" == "2" ]; then
     MODE="iran"
     read -p "Do you want Auto-Sync Xray ports? (y/n): " AUTO_SYNC_INPUT
     if [[ "$AUTO_SYNC_INPUT" == "y" || "$AUTO_SYNC_INPUT" == "Y" ]]; then
-        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --auto-sync"
+        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --auto-sync $ANTI_DPI_FLAG"
     else
         read -p "Enter ports manually (e.g. 80,443,2083): " MANUAL_PORTS
-        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --manual-ports $MANUAL_PORTS"
+        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --manual-ports $MANUAL_PORTS $ANTI_DPI_FLAG"
     fi
 else
     echo "Invalid choice. Exiting."
