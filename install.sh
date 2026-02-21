@@ -76,6 +76,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -184,12 +185,29 @@ func tuneSocket(conn net.Conn) {
 	}
 }
 
-func fastPipe(src net.Conn, dst net.Conn) {
-	buf := bufferPool.Get().([]byte)
-	io.CopyBuffer(dst, src, buf)
-	bufferPool.Put(buf)
-	src.Close()
-	dst.Close()
+func proxyConn(c1, c2 net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	pipe := func(dst, src net.Conn) {
+		defer wg.Done()
+		buf := bufferPool.Get().([]byte)
+		io.CopyBuffer(dst, src, buf)
+		bufferPool.Put(buf)
+
+		if tcpConn, ok := dst.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
+		if tcpConn, ok := src.(*net.TCPConn); ok {
+			tcpConn.CloseRead()
+		}
+	}
+
+	go pipe(c1, c2)
+	pipe(c2, c1)
+	wg.Wait()
+	c1.Close()
+	c2.Close()
 }
 
 // ----------------------------------------------------
@@ -439,10 +457,12 @@ func startEurope() {
 
 func handleEuropeStream(stream *smux.Stream) {
 	header := make([]byte, 2)
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(stream, header); err != nil {
 		stream.Close()
 		return
 	}
+	stream.SetReadDeadline(time.Time{})
 	targetPort := deobfuscatePort(header, authKey)
 	if targetPort == 0 {
 		stream.Close()
@@ -456,8 +476,7 @@ func handleEuropeStream(stream *smux.Stream) {
 	}
 	tuneSocket(localConn)
 
-	go fastPipe(stream, localConn)
-	fastPipe(localConn, stream)
+	proxyConn(stream, localConn)
 }
 
 // ----------------------------------------------------
@@ -474,6 +493,7 @@ func startIran() {
 
 	activePorts := make(map[uint16]bool)
 	var activePortsMu sync.Mutex
+	var sessionRR uint64
 
 	openNewPort := func(p uint16) {
 		activePortsMu.Lock()
@@ -503,14 +523,15 @@ func startIran() {
 
 				go func(c net.Conn) {
 					poolMu.Lock()
-					if len(sessionPool) == 0 {
+					poolSize := uint64(len(sessionPool))
+					if poolSize == 0 {
 						poolMu.Unlock()
 						c.Close()
 						return
 					}
 					// Use round-robin instead of rand for better load balancing
-					sess := sessionPool[0]
-					sessionPool = append(sessionPool[1:], sess)
+					idx := atomic.AddUint64(&sessionRR, 1) % poolSize
+					sess := sessionPool[idx]
 					poolMu.Unlock()
 
 					stream, err := sess.OpenStream()
@@ -521,8 +542,7 @@ func startIran() {
 
 					stream.Write(obfuscatePort(p, authKey))
 
-					go fastPipe(c, stream)
-					fastPipe(stream, c)
+					proxyConn(c, stream)
 				}(clientConn)
 			}
 		}()
@@ -693,6 +713,26 @@ func main() {
 			fmt.Scanln(&password)
 			startEurope()
 		} else {
+			mode = "iran"
+			fmt.Print("[?] Tunnel Bridge Port: ")
+			fmt.Scanln(&bridgePort)
+			fmt.Print("[?] Port Sync Port: ")
+			fmt.Scanln(&syncPort)
+			fmt.Print("[?] Secret Password (must match Europe): ")
+			fmt.Scanln(&password)
+			var auto string
+			fmt.Print("[?] Do you want Auto-Sync Xray ports? (y/n): ")
+			fmt.Scanln(&auto)
+			if strings.ToLower(auto) == "y" {
+				autoSync = true
+			} else {
+				fmt.Print("[?] Enter ports manually (e.g. 80,443,2083): ")
+				fmt.Scanln(&manualPorts)
+			}
+			startIran()
+		}
+	}
+}
 			mode = "iran"
 			fmt.Print("[?] Tunnel Bridge Port: ")
 			fmt.Scanln(&bridgePort)
