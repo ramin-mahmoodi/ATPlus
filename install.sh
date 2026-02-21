@@ -744,14 +744,14 @@ func main() {
 EOF
 
 echo "[+] Compiling ATPlus..."
-go build -o /usr/local/bin/atplus main.go
+go build -o /usr/local/bin/atplus-core main.go
 
-if [ ! -f "/usr/local/bin/atplus" ]; then
+if [ ! -f "/usr/local/bin/atplus-core" ]; then
     echo "[-] Compilation failed! Check dependencies."
     exit 1
 fi
 
-chmod +x /usr/local/bin/atplus
+chmod +x /usr/local/bin/atplus-core
 echo "[+] Compilation successful!"
 echo ""
 
@@ -778,20 +778,79 @@ fi
 if [ "$SERVER_TYPE" == "1" ]; then
     MODE="europe"
     read -p "Enter Iran Server IP: " IRAN_IP
-    EXEC_CMD="/usr/local/bin/atplus --mode europe --iran-ip $IRAN_IP --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" $ANTI_DPI_FLAG"
+    EXEC_CMD="/usr/local/bin/atplus-core --mode europe --iran-ip $IRAN_IP --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" $ANTI_DPI_FLAG"
 elif [ "$SERVER_TYPE" == "2" ]; then
     MODE="iran"
     read -p "Do you want Auto-Sync Xray ports? (y/n): " AUTO_SYNC_INPUT
     if [[ "$AUTO_SYNC_INPUT" == "y" || "$AUTO_SYNC_INPUT" == "Y" ]]; then
-        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --auto-sync $ANTI_DPI_FLAG"
+        EXEC_CMD="/usr/local/bin/atplus-core --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --auto-sync $ANTI_DPI_FLAG"
     else
         read -p "Enter ports manually (e.g. 80,443,2083): " MANUAL_PORTS
-        EXEC_CMD="/usr/local/bin/atplus --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --manual-ports $MANUAL_PORTS $ANTI_DPI_FLAG"
+        EXEC_CMD="/usr/local/bin/atplus-core --mode iran --bridge-port $BRIDGE_PORT --sync-port $SYNC_PORT --password \"$PASSWORD\" --manual-ports $MANUAL_PORTS $ANTI_DPI_FLAG"
     fi
 else
     echo "Invalid choice. Exiting."
     exit 1
 fi
+
+echo "[+] Generating ATPlus Interactive CLI Menu..."
+cat > /usr/local/bin/atplus << 'EOF'
+#!/bin/bash
+if [ "$1" != "" ]; then
+    /usr/local/bin/atplus-core "$@"
+    exit $?
+fi
+
+while true; do
+	clear
+	echo "###########################################"
+	echo "#         🚀 ATPlus Manager Menu          #"
+	echo "###########################################"
+	echo "1) 📊 Show Service Status"
+	echo "2) 📝 View Live Logs (journalctl)"
+	echo "3) 🔄 Restart ATPlus Service"
+	echo "4) 🛑 Stop ATPlus Service"
+	echo "5) ▶️ Start ATPlus Service"
+	echo "6) 🔄 Update / Reconfigure (Run Installer)"
+	echo "7) 🗑️ Uninstall ATPlus Completely"
+	echo "0) 🚪 Exit Menu"
+	echo "-------------------------------------------"
+	read -p "Choose an option [0-7]: " OPTION
+
+	case $OPTION in
+		1) clear; systemctl status atplus; read -n 1 -s -r -p "Press any key to continue..." ;;
+		2) clear; echo "Press CTRL+C to stop viewing logs."; journalctl -u atplus -f ;;
+		3) systemctl restart atplus; echo "Service Restarted."; read -n 1 -s -r -p "Press any key to continue..." ;;
+		4) systemctl stop atplus; echo "Service Stopped."; read -n 1 -s -r -p "Press any key to continue..." ;;
+		5) systemctl start atplus; echo "Service Started."; read -n 1 -s -r -p "Press any key to continue..." ;;
+		6) 
+		   clear
+		   echo "Fetching Latest Installer from GitHub..."
+		   curl -sL "https://raw.githubusercontent.com/ramin-mahmoodi/ATPlus/main/install.sh?v=$(date +%s)" -o /tmp/atplus_update.sh
+		   bash /tmp/atplus_update.sh
+		   exit 0
+		   ;;
+		7) 
+		   clear
+		   read -p "Are you sure you want to completely uninstall ATPlus? (y/n) " CONFIRM
+		   if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+			   echo "Uninstalling ATPlus..."
+			   systemctl stop atplus
+			   systemctl disable atplus
+			   rm -f /etc/systemd/system/atplus.service
+			   systemctl daemon-reload
+			   rm -f /usr/local/bin/atplus*
+			   rm -rf /usr/local/src/atplus
+			   echo "ATPlus uninstalled successfully."
+			   exit 0
+		   fi
+		   ;;
+		0) clear; exit 0 ;;
+		*) echo "Invalid option."; sleep 1 ;;
+	esac
+done
+EOF
+chmod +x /usr/local/bin/atplus
 
 SERVICE_FILE="/etc/systemd/system/atplus.service"
 
@@ -818,5 +877,5 @@ systemctl restart atplus
 
 echo ""
 echo "✅ ATPlus V4 (Anti-DPI) has been installed and started as a service!"
-echo "To check the status, run: systemctl status atplus"
-echo "To view live logs, run: journalctl -u atplus -f"
+echo "You can now manage ATPlus at any time by typing the following command:"
+echo "👉  atplus"
