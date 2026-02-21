@@ -9,8 +9,112 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "###########################################"
-echo "#     🚀 ATPlus v4.0 Go Installer         #"
+echo "#     🚀 ATPlus v5.0 Stable Installer     #"
 echo "###########################################"
+echo ""
+
+# =============================================
+# LINUX KERNEL & NETWORK OPTIMIZATIONS
+# =============================================
+echo "[+] Applying Linux Kernel Optimizations..."
+
+# --- BBR Congestion Control ---
+modprobe tcp_bbr 2>/dev/null
+if grep -q tcp_bbr /proc/modules 2>/dev/null; then
+    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
+    echo "  [✓] BBR Congestion Control enabled"
+else
+    echo "  [!] BBR not available on this kernel, skipping"
+fi
+
+# --- TCP Fast Open (client+server) ---
+sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
+echo "  [✓] TCP Fast Open enabled"
+
+# --- TCP Buffer Ceilings (only raise MAX, never touch defaults) ---
+sysctl -w net.core.rmem_max=16777216 > /dev/null 2>&1
+sysctl -w net.core.wmem_max=16777216 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_rmem="4096 131072 16777216" > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" > /dev/null 2>&1
+echo "  [✓] TCP buffer ceilings raised (defaults untouched)"
+
+# --- TCP Keepalive (detect dead connections faster) ---
+sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
+echo "  [✓] TCP Keepalive intervals reduced"
+
+# --- Connection Queue (handle bursts better) ---
+sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1
+sysctl -w net.core.netdev_max_backlog=8192 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192 > /dev/null 2>&1
+echo "  [✓] Connection queue limits raised"
+
+# --- Disable IPv6 (if not used, reduces overhead) ---
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 > /dev/null 2>&1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 > /dev/null 2>&1
+echo "  [✓] IPv6 disabled"
+
+# --- Reduce Swappiness ---
+sysctl -w vm.swappiness=10 > /dev/null 2>&1
+echo "  [✓] Swappiness reduced to 10"
+
+# --- TCP Tweaks ---
+sysctl -w net.ipv4.tcp_tw_reuse=1 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
+echo "  [✓] TIME_WAIT reuse + no slow start after idle"
+
+# --- Disable Conntrack (reduce per-packet latency) ---
+if lsmod | grep -q nf_conntrack 2>/dev/null; then
+    rmmod nf_conntrack_netlink 2>/dev/null
+    rmmod xt_conntrack 2>/dev/null
+    # Only attempt if iptables is not actively using it
+    if rmmod nf_conntrack 2>/dev/null; then
+        echo "  [✓] Connection tracking disabled"
+    else
+        echo "  [!] Conntrack in use by iptables, increasing table size instead"
+        sysctl -w net.netfilter.nf_conntrack_max=524288 > /dev/null 2>&1
+    fi
+else
+    echo "  [✓] Connection tracking already disabled"
+fi
+
+# --- File Descriptor Limits ---
+if ! grep -q "* soft nofile" /etc/security/limits.conf 2>/dev/null; then
+    echo "* soft nofile 1000000" >> /etc/security/limits.conf
+    echo "* hard nofile 1000000" >> /etc/security/limits.conf
+    echo "  [✓] File descriptor limits raised to 1M"
+else
+    echo "  [✓] File descriptor limits already configured"
+fi
+ulimit -n 1000000 2>/dev/null
+
+# --- Make sysctl persistent ---
+cat > /etc/sysctl.d/99-atplus.conf << 'SYSEOF'
+# ATPlus Network Optimizations
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 131072 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=6
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=8192
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+vm.swappiness=10
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_slow_start_after_idle=0
+SYSEOF
+echo "  [✓] All optimizations persisted to /etc/sysctl.d/99-atplus.conf"
 echo ""
 
 systemctl stop atplus 2>/dev/null
@@ -1057,7 +1161,7 @@ SERVICE_FILE="/etc/systemd/system/atplus.service"
 
 cat > $SERVICE_FILE <<EOF
 [Unit]
-Description=ATPlus Reverse TCP Tunnel (Anti-DPI Edition)
+Description=ATPlus Reverse TCP Tunnel (Stable Edition)
 After=network.target
 
 [Service]
@@ -1067,6 +1171,7 @@ ExecStart=$EXEC_CMD
 Restart=always
 RestartSec=5
 LimitNOFILE=1000000
+Nice=-10
 
 [Install]
 WantedBy=multi-user.target
@@ -1077,6 +1182,6 @@ systemctl enable atplus
 systemctl restart atplus
 
 echo ""
-echo "✅ ATPlus V4 (Anti-DPI) has been installed and started as a service!"
+echo "✅ ATPlus V5.0 (Stable) has been installed and started as a service!"
 echo "You can now manage ATPlus at any time by typing the following command:"
 echo "👉  atplus"
