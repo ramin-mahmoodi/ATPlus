@@ -152,8 +152,14 @@ rm -f go.mod go.sum main.go
 go mod init atplus
 
 echo "[+] Setting up Go module proxy..."
-export GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
-go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
+export GONOSUMDB=*
+export GONOSUMCHECK=*
+export GOFLAGS=-insecure
+export GOPROXY=direct,https://proxy.golang.org,https://goproxy.io
+go env -w GONOSUMDB=*
+go env -w GONOSUMCHECK=*
+go env -w GONOSUMDB=*
+go env -w GOPROXY=direct,https://proxy.golang.org,https://goproxy.io
 
 echo "[+] Generating ATPlus Source Code..."
 cat > /usr/local/src/atplus/main.go << 'EOF'
