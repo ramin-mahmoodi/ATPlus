@@ -152,12 +152,22 @@ rm -f go.mod go.sum main.go
 go mod init atplus
 
 echo "[+] Bypassing DNS blocks for Go modules..."
-export GOPROXY=direct,https://goproxy.io,https://goproxy.cn
-go env -w GOPROXY=direct,https://goproxy.io,https://goproxy.cn
+export GOPROXY=https://goproxy.io,https://goproxy.cn,direct
+go env -w GOPROXY=https://goproxy.io,https://goproxy.cn,direct
 
 echo "[+] Downloading dependencies..."
 go get github.com/xtaci/smux
 go get github.com/refraction-networking/utls
+go mod tidy
+
+if ! go mod verify > /dev/null 2>&1; then
+    echo "[-] Dependencies not fully resolved. Retrying with alternate proxy..."
+    export GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
+    go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
+    go get github.com/xtaci/smux
+    go get github.com/refraction-networking/utls
+    go mod tidy
+fi
 
 echo "[+] Generating ATPlus Source Code..."
 cat > /usr/local/src/atplus/main.go << 'EOF'
