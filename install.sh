@@ -759,6 +759,42 @@ func startIran() {
 	var activePortsMu sync.Mutex
 	var sessionRR uint64
 
+	// Smart Pooling: Iran-side health check — proactively remove dead sessions
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-ticker.C:
+				poolMu.Lock()
+				var dead []*managedSession
+				for _, ms := range sessionPool {
+					if ms.IsClosed() {
+						dead = append(dead, ms)
+						continue
+					}
+					// Non-intrusive probe: smux Ping (1 byte, ~0 overhead)
+					ms.SetDeadline(time.Now().Add(3 * time.Second))
+					stream, err := ms.OpenStream()
+					ms.SetDeadline(time.Time{})
+					if err != nil {
+						dead = append(dead, ms)
+						continue
+					}
+					stream.Close()
+				}
+				for _, d := range dead {
+					removeSessionLocked(d)
+					logWarn("Iran health check: removed dead session (age: %s)", time.Since(d.createdAt).Round(time.Second))
+					d.Close()
+				}
+				poolMu.Unlock()
+			}
+		}
+	}()
+
 	openNewPort := func(p uint16) {
 		activePortsMu.Lock()
 		if activePorts[p] {
@@ -791,30 +827,35 @@ func startIran() {
 				tuneSocket(clientConn)
 
 				go func(c net.Conn) {
-					// Feature 5: Session Failover — try up to 3 sessions
-					var stream *smux.Stream
-					maxRetries := 3
+					// Smart Pooling: snapshot the pool to avoid locking during OpenStream
+					poolMu.Lock()
+					poolSnap := make([]*managedSession, len(sessionPool))
+					copy(poolSnap, sessionPool)
+					poolMu.Unlock()
 
-					for attempt := 0; attempt < maxRetries; attempt++ {
-						poolMu.Lock()
-						poolSize := uint64(len(sessionPool))
-						if poolSize == 0 {
-							poolMu.Unlock()
-							if attempt == 0 {
-								logWarn("No sessions available for port %d", p)
-							}
-							break
+					if len(poolSnap) == 0 {
+						logWarn("No sessions available for port %d", p)
+						c.Close()
+						return
+					}
+
+					// Try each session in the snapshot (Round Robin start)
+					var stream *smux.Stream
+					start := int(atomic.AddUint64(&sessionRR, 1) % uint64(len(poolSnap)))
+
+					for i := 0; i < len(poolSnap); i++ {
+						idx := (start + i) % len(poolSnap)
+						ms := poolSnap[idx]
+
+						if ms.IsClosed() {
+							continue
 						}
-						idx := atomic.AddUint64(&sessionRR, 1) % poolSize
-						sess := sessionPool[idx]
-						poolMu.Unlock()
 
 						var err error
-						stream, err = sess.OpenStream()
+						stream, err = ms.OpenStream()
 						if err == nil {
-							break // success
+							break
 						}
-						logWarn("OpenStream failed on session %d (attempt %d/%d): %v", idx, attempt+1, maxRetries, err)
 						stream = nil
 					}
 
