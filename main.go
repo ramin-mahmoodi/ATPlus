@@ -137,11 +137,11 @@ func proxyConn(c1, c2 net.Conn) {
 		io.CopyBuffer(dst, src, buf)
 		bufferPool.Put(buf)
 
-		if tcpConn, ok := dst.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
+		if hw, ok := dst.(interface{ CloseWrite() error }); ok {
+			hw.CloseWrite()
 		}
-		if tcpConn, ok := src.(*net.TCPConn); ok {
-			tcpConn.CloseRead()
+		if hr, ok := src.(interface{ CloseRead() error }); ok {
+			hr.CloseRead()
 		}
 	}
 
@@ -158,10 +158,11 @@ func proxyConn(c1, c2 net.Conn) {
 
 type fragConn struct {
 	net.Conn
+	written int
 }
 
 func (c *fragConn) Write(b []byte) (n int, err error) {
-	if len(b) > 50 {
+	if c.written < 1000 && len(b) > 50 {
 		chunks := [][]byte{
 			b[:10],
 			b[10:30],
@@ -171,6 +172,7 @@ func (c *fragConn) Write(b []byte) (n int, err error) {
 		for _, chunk := range chunks {
 			nn, err := c.Conn.Write(chunk)
 			n += nn
+			c.written += nn
 			if err != nil {
 				return n, err
 			}
@@ -178,7 +180,9 @@ func (c *fragConn) Write(b []byte) (n int, err error) {
 		}
 		return n, nil
 	}
-	return c.Conn.Write(b)
+	nn, err := c.Conn.Write(b)
+	c.written += nn
+	return nn, err
 }
 
 func generateDummyCert() (tls.Certificate, error) {
@@ -234,7 +238,7 @@ func createEuropeMultiplexer() (*smux.Session, error) {
 	var transportConn net.Conn = rawConn
 
 	if antiDpi {
-		fConn := &fragConn{rawConn}
+		fConn := &fragConn{Conn: rawConn}
 		config := &utls.Config{ServerName: "www.google.com", InsecureSkipVerify: true}
 		tlsConn := utls.UClient(fConn, config, utls.HelloChrome_120)
 
@@ -549,6 +553,15 @@ func startIran() {
 		os.Exit(1)
 	}
 
+	var globalCert tls.Certificate
+	if antiDpi {
+		globalCert, err = generateDummyCert()
+		if err != nil {
+			fmt.Printf("❌ Failed to generate dummy cert: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	for {
 		rawConn, err := bridgeListener.Accept()
 		if err != nil {
@@ -561,13 +574,8 @@ func startIran() {
 			var transportConn net.Conn = c
 
 			if antiDpi {
-				cert, err := generateDummyCert()
-				if err != nil {
-					c.Close()
-					return
-				}
 				tlsConfig := &tls.Config{
-					Certificates: []tls.Certificate{cert},
+					Certificates: []tls.Certificate{globalCert},
 					MinVersion:   tls.VersionTLS12,
 				}
 				tlsSrv := tls.Server(c, tlsConfig)
