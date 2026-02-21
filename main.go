@@ -329,7 +329,6 @@ func startIran() {
 
 				go func(c net.Conn) {
 					poolMu.Lock()
-					poolSize := len(sessionPool)
 					if len(sessionPool) == 0 {
 						poolMu.Unlock()
 						c.Close()
@@ -498,3 +497,6 @@ func main() {
 				fmt.Scanln(&manualPorts)
 			}
 			startIran()
+		}
+	}
+}
