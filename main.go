@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
@@ -14,15 +15,37 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/smux"
 )
+
+// ----------------------------------------------------
+// LEVELED LOGGING (Feature 6)
+// ----------------------------------------------------
+
+func logInfo(format string, args ...interface{}) {
+	fmt.Printf("[%s] [INFO]  %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+func logWarn(format string, args ...interface{}) {
+	fmt.Printf("[%s] [WARN]  %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+func logError(format string, args ...interface{}) {
+	fmt.Printf("[%s] [ERROR] %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// ----------------------------------------------------
+// GLOBALS
+// ----------------------------------------------------
 
 var (
 	mode        string
@@ -42,7 +65,7 @@ var (
 	reset   = "\033[0m"
 
 	poolMu         sync.Mutex
-	sessionPool    []*smux.Session
+	sessionPool    []*managedSession
 	maxSmuxTunnels = 16
 
 	bufferPool = sync.Pool{
@@ -50,7 +73,20 @@ var (
 			return make([]byte, 32768)
 		},
 	}
+
+	// Feature 3: Graceful Shutdown
+	activeConns sync.WaitGroup
+	globalCtx   context.Context
+	globalStop  context.CancelFunc
 )
+
+// Feature 4: Connection Recycling — wraps smux.Session with creation timestamp
+type managedSession struct {
+	*smux.Session
+	createdAt time.Time
+}
+
+const sessionTTL = 30 * time.Minute // Feature 4: max session lifetime
 
 func init() {
 	flag.StringVar(&mode, "mode", "", "europe or iran")
@@ -66,7 +102,7 @@ func init() {
 func printBanner(m string) {
 	fmt.Print("\033[H\033[2J")
 	banner := fmt.Sprintf(`%s%s###########################################
-#          🚀 ATPlus v4.1 (SMUX Raw)      #
+#          🚀 ATPlus v5.0 (Stable)        #
 #      📢 Channel: @Telhost1             #
 ###########################################%s
 %s      AMIR
@@ -80,7 +116,8 @@ func printBanner(m string) {
     %sHorned Man%s             %s    Linux Tux%s
 %s[+] Multiplexing (Smux) Engine Active
 [+] Zero-Copy Memory Pools
-[+] CPU-Optimized RAW Tunnel (No TLS Double-Encrypt)
+[+] Health Check + Auto-Reconnect + Graceful Shutdown
+[+] Session Recycling (TTL: 30m) + Failover
 [+] Mode: %s%s
 -------------------------------------------
 `,
@@ -127,6 +164,9 @@ func tuneSocket(conn net.Conn) {
 }
 
 func proxyConn(c1, c2 net.Conn) {
+	activeConns.Add(1)
+	defer activeConns.Done()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -175,7 +215,7 @@ func (c *fragConn) Write(b []byte) (n int, err error) {
 			if err != nil {
 				return n, err
 			}
-			time.Sleep(2 * time.Millisecond) // micro-delay
+			time.Sleep(2 * time.Millisecond)
 		}
 		return n, nil
 	}
@@ -224,10 +264,23 @@ func generateDummyCert() (tls.Certificate, error) {
 }
 
 // ----------------------------------------------------
+// SMUX CONFIG FACTORY
+// ----------------------------------------------------
+
+func newSmuxConfig() *smux.Config {
+	cfg := smux.DefaultConfig()
+	cfg.MaxReceiveBuffer = 4194304 * 2
+	cfg.MaxStreamBuffer = 4194304
+	cfg.KeepAliveInterval = 10 * time.Second
+	cfg.KeepAliveTimeout = 30 * time.Second
+	return cfg
+}
+
+// ----------------------------------------------------
 // MULTIPLEXER FACTORY
 // ----------------------------------------------------
 
-func createEuropeMultiplexer() (*smux.Session, error) {
+func createEuropeMultiplexer() (*managedSession, error) {
 	rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, bridgePort), 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -261,18 +314,13 @@ func createEuropeMultiplexer() (*smux.Session, error) {
 		return nil, err
 	}
 
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.MaxReceiveBuffer = 4194304 * 2
-	smuxConfig.MaxStreamBuffer = 4194304
-	smuxConfig.KeepAliveInterval = 10 * time.Second
-	smuxConfig.KeepAliveTimeout = 30 * time.Second
-	session, err := smux.Client(transportConn, smuxConfig)
+	session, err := smux.Client(transportConn, newSmuxConfig())
 	if err != nil {
 		transportConn.Close()
 		return nil, err
 	}
 
-	return session, nil
+	return &managedSession{Session: session, createdAt: time.Now()}, nil
 }
 
 // ----------------------------------------------------
@@ -311,79 +359,146 @@ func getXrayPorts() []uint16 {
 
 func startEurope() {
 	if iranIP == "" || bridgePort == 0 || syncPort == 0 || password == "" {
-		fmt.Println("Missing arguments for Europe mode.")
+		logError("Missing arguments for Europe mode.")
 		os.Exit(1)
 	}
 	printBanner("EUROPE (XRAY CONNECTOR)")
 	authKey = getAuthKey(password)
 
+	// Feature 1: Health Check — probes sessions every 15s
 	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(10 * time.Minute)
-			poolMu.Lock()
-			if len(sessionPool) > 0 {
-				oldSession := sessionPool[0]
-				sessionPool = sessionPool[1:]
-				poolMu.Unlock()
-				oldSession.Close()
-			} else {
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-ticker.C:
+				poolMu.Lock()
+				var dead []*managedSession
+				for _, ms := range sessionPool {
+					if ms.IsClosed() {
+						dead = append(dead, ms)
+						continue
+					}
+					// Quick probe: open a stream and immediately close it
+					stream, err := ms.OpenStream()
+					if err != nil {
+						dead = append(dead, ms)
+						continue
+					}
+					stream.Close()
+				}
+				for _, d := range dead {
+					removeSessionLocked(d)
+					logWarn("Health check: removed dead session (age: %s)", time.Since(d.createdAt).Round(time.Second))
+					d.Close()
+				}
 				poolMu.Unlock()
 			}
 		}
 	}()
 
+	// Feature 4: Connection Recycling — retire sessions older than TTL
 	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
 		for {
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-ticker.C:
+				poolMu.Lock()
+				var expired []*managedSession
+				for _, ms := range sessionPool {
+					if time.Since(ms.createdAt) > sessionTTL {
+						expired = append(expired, ms)
+					}
+				}
+				for _, ms := range expired {
+					removeSessionLocked(ms)
+					logInfo("Recycled session (lived %s)", time.Since(ms.createdAt).Round(time.Second))
+					ms.Close()
+				}
+				poolMu.Unlock()
+			}
+		}
+	}()
+
+	// Session builder with Feature 2: Exponential Backoff
+	go func() {
+		backoff := 500 * time.Millisecond
+		const maxBackoff = 30 * time.Second
+
+		for {
+			select {
+			case <-globalCtx.Done():
+				return
+			default:
+			}
+
 			poolMu.Lock()
 			currentLinks := len(sessionPool)
 			poolMu.Unlock()
 
 			if currentLinks < maxSmuxTunnels {
-				var wg sync.WaitGroup
 				needed := maxSmuxTunnels - currentLinks
+				successCount := int32(0)
+				var wg sync.WaitGroup
 				for i := 0; i < needed; i++ {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						if session, err := createEuropeMultiplexer(); err == nil {
-							poolMu.Lock()
-							if len(sessionPool) < maxSmuxTunnels {
-								sessionPool = append(sessionPool, session)
-								go func(sess *smux.Session) {
-									for {
-										stream, err := sess.AcceptStream()
-										if err != nil {
-											break
-										}
-										go handleEuropeStream(stream)
-									}
-									poolMu.Lock()
-									for k, s := range sessionPool {
-										if s == sess {
-											sessionPool = append(sessionPool[:k], sessionPool[k+1:]...)
-											break
-										}
-									}
-									poolMu.Unlock()
-								}(session)
-							} else {
-								session.Close()
-							}
-							poolMu.Unlock()
+						ms, err := createEuropeMultiplexer()
+						if err != nil {
+							return
 						}
+						poolMu.Lock()
+						if len(sessionPool) < maxSmuxTunnels {
+							sessionPool = append(sessionPool, ms)
+							atomic.AddInt32(&successCount, 1)
+							go europeSessionWorker(ms)
+						} else {
+							ms.Close()
+						}
+						poolMu.Unlock()
 					}()
 				}
 				wg.Wait()
+
+				// Feature 2: Adjust backoff
+				if atomic.LoadInt32(&successCount) > 0 {
+					backoff = 500 * time.Millisecond // reset on success
+				} else {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					logWarn("All reconnect attempts failed, backing off %s", backoff)
+				}
+			} else {
+				backoff = 500 * time.Millisecond // pool full, reset
 			}
-			time.Sleep(200 * time.Millisecond)
+
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
 		}
 	}()
 
+	// Port sync goroutine
 	go func() {
 		for {
+			select {
+			case <-globalCtx.Done():
+				return
+			default:
+			}
+
 			if rawConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", iranIP, syncPort), 5*time.Second); err == nil {
 				tuneSocket(rawConn)
-
 				rawConn.Write(authKey)
 
 				ports := getXrayPorts()
@@ -399,12 +514,34 @@ func startEurope() {
 				rawConn.Write(buf)
 				rawConn.Close()
 			}
-			time.Sleep(5 * time.Second)
+
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
 	}()
 
-	fmt.Printf("✅ Running... Sync: %d | Bridge: %d | Multiplexing: Active\n", syncPort, bridgePort)
-	select {}
+	logInfo("Running... Sync: %d | Bridge: %d | Tunnels: %d | Recycling: %s", syncPort, bridgePort, maxSmuxTunnels, sessionTTL)
+	<-globalCtx.Done()
+	logInfo("Shutdown signal received, waiting for active connections...")
+	activeConns.Wait()
+	logInfo("All connections drained. Goodbye!")
+}
+
+// europeSessionWorker accepts streams on a session and removes it from the pool when it dies.
+func europeSessionWorker(ms *managedSession) {
+	for {
+		stream, err := ms.AcceptStream()
+		if err != nil {
+			break
+		}
+		go handleEuropeStream(stream)
+	}
+	poolMu.Lock()
+	removeSessionLocked(ms)
+	poolMu.Unlock()
 }
 
 func handleEuropeStream(stream *smux.Stream) {
@@ -431,13 +568,23 @@ func handleEuropeStream(stream *smux.Stream) {
 	proxyConn(stream, localConn)
 }
 
+// removeSessionLocked removes a managed session from the pool. Caller MUST hold poolMu.
+func removeSessionLocked(target *managedSession) {
+	for i, s := range sessionPool {
+		if s == target {
+			sessionPool = append(sessionPool[:i], sessionPool[i+1:]...)
+			return
+		}
+	}
+}
+
 // ----------------------------------------------------
 // IRAN
 // ----------------------------------------------------
 
 func startIran() {
 	if bridgePort == 0 || syncPort == 0 || password == "" {
-		fmt.Println("Missing arguments for Iran mode.")
+		logError("Missing arguments for Iran mode.")
 		os.Exit(1)
 	}
 	printBanner("IRAN (FLEX LISTENER)")
@@ -463,31 +610,50 @@ func startIran() {
 			activePortsMu.Unlock()
 			return
 		}
-		fmt.Printf("✨ Port Active: %d\n", p)
+		logInfo("Port Active: %d", p)
 
 		go func() {
 			for {
 				clientConn, err := listener.Accept()
 				if err != nil {
-					continue
+					select {
+					case <-globalCtx.Done():
+						return
+					default:
+						continue
+					}
 				}
 				tuneSocket(clientConn)
 
 				go func(c net.Conn) {
-					poolMu.Lock()
-					poolSize := uint64(len(sessionPool))
-					if poolSize == 0 {
-						poolMu.Unlock()
-						c.Close()
-						return
-					}
-					// Use round-robin instead of rand for better load balancing
-					idx := atomic.AddUint64(&sessionRR, 1) % poolSize
-					sess := sessionPool[idx]
-					poolMu.Unlock()
+					// Feature 5: Session Failover — try up to 3 sessions
+					var stream *smux.Stream
+					maxRetries := 3
 
-					stream, err := sess.OpenStream()
-					if err != nil {
+					for attempt := 0; attempt < maxRetries; attempt++ {
+						poolMu.Lock()
+						poolSize := uint64(len(sessionPool))
+						if poolSize == 0 {
+							poolMu.Unlock()
+							if attempt == 0 {
+								logWarn("No sessions available for port %d", p)
+							}
+							break
+						}
+						idx := atomic.AddUint64(&sessionRR, 1) % poolSize
+						sess := sessionPool[idx]
+						poolMu.Unlock()
+
+						var err error
+						stream, err = sess.OpenStream()
+						if err == nil {
+							break // success
+						}
+						logWarn("OpenStream failed on session %d (attempt %d/%d): %v", idx, attempt+1, maxRetries, err)
+						stream = nil
+					}
+
+					if stream == nil {
 						c.Close()
 						return
 					}
@@ -504,6 +670,7 @@ func startIran() {
 		}()
 	}
 
+	// Port sync / manual ports
 	go func() {
 		if !autoSync {
 			if manualPorts != "" {
@@ -512,7 +679,7 @@ func startIran() {
 						openNewPort(uint16(p))
 					}
 				}
-				fmt.Println("✅ Manual Ports Opened.")
+				logInfo("Manual Ports Opened.")
 			}
 			return
 		}
@@ -521,12 +688,17 @@ func startIran() {
 		if err != nil {
 			return
 		}
-		fmt.Printf("🔍 Auto-Sync Active on port %d\n", syncPort)
+		logInfo("Auto-Sync Active on port %d", syncPort)
 
 		for {
 			rawConn, err := listener.Accept()
 			if err != nil {
-				continue
+				select {
+				case <-globalCtx.Done():
+					return
+				default:
+					continue
+				}
 			}
 
 			go func(c net.Conn) {
@@ -557,9 +729,10 @@ func startIran() {
 		}
 	}()
 
+	// Bridge listener
 	bridgeListener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", bridgePort))
 	if err != nil {
-		fmt.Printf("❌ Bridge listener error: %v\n", err)
+		logError("Bridge listener error: %v", err)
 		os.Exit(1)
 	}
 
@@ -567,15 +740,25 @@ func startIran() {
 	if antiDpi {
 		globalCert, err = generateDummyCert()
 		if err != nil {
-			fmt.Printf("❌ Failed to generate dummy cert: %v\n", err)
+			logError("Failed to generate dummy cert: %v", err)
 			os.Exit(1)
 		}
 	}
 
+	logInfo("Running... Bridge: %d | Sync: %d | Failover: 3 retries | Recycling: %s", bridgePort, syncPort, sessionTTL)
+
 	for {
 		rawConn, err := bridgeListener.Accept()
 		if err != nil {
-			continue
+			select {
+			case <-globalCtx.Done():
+				logInfo("Shutdown signal received, waiting for active connections...")
+				activeConns.Wait()
+				logInfo("All connections drained. Goodbye!")
+				return
+			default:
+				continue
+			}
 		}
 		tuneSocket(rawConn)
 
@@ -615,31 +798,24 @@ func startIran() {
 			}
 			transportConn.SetReadDeadline(time.Time{})
 
-			smuxConfig := smux.DefaultConfig()
-			smuxConfig.MaxReceiveBuffer = 4194304 * 2
-			smuxConfig.MaxStreamBuffer = 4194304
-			smuxConfig.KeepAliveInterval = 10 * time.Second
-			smuxConfig.KeepAliveTimeout = 30 * time.Second
-			session, err := smux.Server(transportConn, smuxConfig)
+			session, err := smux.Server(transportConn, newSmuxConfig())
 			if err != nil {
 				transportConn.Close()
 				return
 			}
 
+			ms := &managedSession{Session: session, createdAt: time.Now()}
 			poolMu.Lock()
-			sessionPool = append(sessionPool, session)
+			sessionPool = append(sessionPool, ms)
 			poolMu.Unlock()
+			logInfo("New bridge session established (total: %d)", len(sessionPool))
 
 			go func() {
 				<-session.CloseChan()
 				poolMu.Lock()
-				for i, s := range sessionPool {
-					if s == session {
-						sessionPool = append(sessionPool[:i], sessionPool[i+1:]...)
-						break
-					}
-				}
+				removeSessionLocked(ms)
 				poolMu.Unlock()
+				logWarn("Bridge session closed (remaining: %d)", len(sessionPool))
 			}()
 		}(rawConn)
 	}
@@ -647,6 +823,22 @@ func startIran() {
 
 func main() {
 	flag.Parse()
+
+	// Feature 3: Graceful Shutdown
+	globalCtx, globalStop = context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		logWarn("Received signal: %v — initiating graceful shutdown...", sig)
+		globalStop()
+
+		// Hard deadline: force exit after 10 seconds
+		time.AfterFunc(10*time.Second, func() {
+			logError("Graceful shutdown timed out, forcing exit!")
+			os.Exit(1)
+		})
+	}()
 
 	if mode == "europe" {
 		startEurope()
