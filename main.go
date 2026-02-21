@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	mRand "math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -249,12 +248,18 @@ func createEuropeMultiplexer() (*smux.Session, error) {
 
 		// HTTP Decoy
 		decoyReq := "GET / HTTP/1.1\r\nHost: www.google.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: upgrade\r\n\r\n"
-		tlsConn.Write([]byte(decoyReq))
+		if _, err := tlsConn.Write([]byte(decoyReq)); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
 
 		transportConn = tlsConn
 	}
 
-	transportConn.Write(authKey)
+	if _, err := transportConn.Write(authKey); err != nil {
+		transportConn.Close()
+		return nil, err
+	}
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = 4194304 * 2
@@ -386,7 +391,8 @@ func startEurope() {
 				if count > 255 {
 					count = 255
 				}
-				buf := []byte{byte(count)}
+				buf := make([]byte, 0, 1+count*2)
+				buf = append(buf, byte(count))
 				for i := 0; i < count; i++ {
 					buf = append(buf, obfuscatePort(ports[i], authKey)...)
 				}
@@ -486,7 +492,11 @@ func startIran() {
 						return
 					}
 
-					stream.Write(obfuscatePort(p, authKey))
+					if _, err := stream.Write(obfuscatePort(p, authKey)); err != nil {
+						stream.Close()
+						c.Close()
+						return
+					}
 
 					proxyConn(c, stream)
 				}(clientConn)
@@ -636,7 +646,6 @@ func startIran() {
 }
 
 func main() {
-	mRand.Seed(time.Now().UnixNano())
 	flag.Parse()
 
 	if mode == "europe" {
